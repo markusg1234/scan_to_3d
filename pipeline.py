@@ -254,6 +254,15 @@ def pick_sharpest(scores, count):
     ]
 
 
+def select_expression(frames):
+    """Build an ffmpeg expression that is true only for these frames."""
+    # ffmpeg 9.0.2 refuses a plain chain of over 100 terms, but nested pairs have no limit.
+    if len(frames) == 1:
+        return f"eq(n,{frames[0]})"
+    middle = len(frames) // 2
+    return f"({select_expression(frames[:middle])}+{select_expression(frames[middle:])})"
+
+
 def format_duration(seconds):
     """Format a duration like a clock: 0:08, 3:48 or 1:02:05."""
     minutes, seconds = divmod(int(seconds), 60)
@@ -586,8 +595,9 @@ class Pipeline:
             )
         picked = pick_sharpest(scores, self.video_frames)
         # A file, because a long list of frames could pass the command line's limit.
-        select ="+".join(f"eq(n,{frame})" for frame in picked)
-        (self.work_dir / "select.txt").write_text(f"select='{select}'", encoding="utf-8")
+        (self.work_dir / "select.txt").write_text(
+            f"select='{select_expression(picked)}'", encoding="utf-8"
+        )
         self._ffmpeg(
             "-i", self.source,
             "-map", "0:v:0",

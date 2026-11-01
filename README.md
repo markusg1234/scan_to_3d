@@ -71,7 +71,9 @@ You can use a video instead of a photo folder. In the window, click **Video...**
 
 The program splits the video into equal parts and keeps the sharpest frame from each. It uses 100 frames unless you change **Video frames** in the window or add `--frames`. More frames take longer, because every frame is compared with every other. A rerun can't continue with a different frame count, so tick **Start over** or add `--restart` when you change it.
 
-Video input has only been tested on videos rendered in Blender, not on real phone footage yet. Photos should still give better models, because a video frame holds less detail than a photo. To get the most from a video:
+The only upper limit is the number of frames in the video. The arrows on the **Video frames** box stop at 500, but you can type a higher number. Quality usually matters more than frame count: on a 29-second phone video of a door knob, High at 100 frames took about as long as Draft at 250 and came out better.
+
+Video input has been tried on one real phone video so far. Photos should still give better models, because a video frame holds less detail than a photo. To get the most from a video:
 
 1. Film a slow, full circle of 30 to 60 seconds around the object, then another from higher up.
 2. Use the highest resolution your camera offers, in standard video rather than HDR.

@@ -20,6 +20,7 @@ from pipeline import (
     photo_problems,
     pick_sharpest,
     read_camera_centers,
+    select_expression,
     viewing_angle,
 )
 
@@ -399,6 +400,13 @@ class VideoTests(PipelineTestCase):
         self.run_video()
         self.assertEqual(self.picked_frames(), [2, 4, 9])
 
+    def test_a_long_frame_list_reaches_ffmpeg_in_groups(self):
+        blur_scores = [float(frame % 7 + 1) for frame in range(600)]
+        self.run_video(FakeRunner(blur_scores=blur_scores), video_frames=250)
+        self.assertEqual(len(self.picked_frames()), 250)
+        text = (self.output / "work" / "select.txt").read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"\+eq\(n,\d+\)\+")
+
     def test_the_video_goes_to_ffmpeg_in_both_passes(self):
         _, runner = self.run_video()
         passes = [command for stage, command, _ in runner.calls if stage == "frames"]
@@ -595,6 +603,26 @@ class ParsingTests(unittest.TestCase):
 
     def test_picking_from_no_frames_gives_nothing(self):
         self.assertEqual(pick_sharpest({}, 10), [])
+
+    def test_the_expression_selects_only_the_picked_frames(self):
+        frames = [2, 7, 8, 40, 41]
+        expression = select_expression(frames)
+        for n in range(50):
+            selected = eval(expression, {"eq": lambda a, b: a == b, "n": n})
+            self.assertEqual(bool(selected), n in frames)
+
+    def test_one_frame_needs_no_group(self):
+        self.assertEqual(select_expression([7]), "eq(n,7)")
+
+    def test_long_frame_lists_avoid_ffmpegs_limit_on_chains(self):
+        expression = select_expression(list(range(1000)))
+        self.assertEqual(len(re.findall(r"eq\(n,\d+\)", expression)), 1000)
+        self.assertNotRegex(expression, r"\+eq\(n,\d+\)\+")
+        depth = deepest = 0
+        for character in expression:
+            depth += {"(": 1, ")": -1}.get(character, 0)
+            deepest = max(deepest, depth)
+        self.assertLess(deepest, 15)
 
     def test_durations_read_like_a_clock(self):
         self.assertEqual(format_duration(0), "0:00")
