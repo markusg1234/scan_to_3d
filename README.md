@@ -1,6 +1,6 @@
 # Photo to 3D
 
-Turns a folder of overlapping photos, taken from different angles, into a textured 3D model. It works out where each photo was taken with [COLMAP](https://colmap.github.io/), then builds the surface and texture with [OpenMVS](https://github.com/cdcseacave/openMVS).
+Turns overlapping photos taken from different angles, or a video that circles an object, into a textured 3D model. It works out where each photo was taken with [COLMAP](https://colmap.github.io/), then builds the surface and texture with [OpenMVS](https://github.com/cdcseacave/openMVS).
 
 ## Setup
 
@@ -10,7 +10,7 @@ Needs Windows and Python (tested on 3.14). Nothing else has to be installed.
 python setup_tools.py
 ```
 
-This downloads the pinned official Windows builds into `tools/` and checks their checksums. Windows Defender may warn about COLMAP because its binaries are not signed.
+This downloads pinned Windows builds of COLMAP, OpenMVS and ffmpeg into `tools/` and checks their checksums. Windows Defender may warn about COLMAP because its binaries are not signed. If you set up the program before video input was added, run this again to add ffmpeg.
 
 ## Use
 
@@ -20,12 +20,13 @@ Open the window:
 python gui.py
 ```
 
-The window shows a running timer and how long each stage took. It also remembers your last photo and output folders in `gui_settings.json`.
+The window shows a running timer and how long each stage took. It also remembers your last photos or video, output folder and frame count in `gui_settings.json`.
 
 Or use the command line:
 
 ```
 python cli.py "C:\path\to\photos" "C:\path\to\output" --quality normal
+python cli.py "C:\path\to\video.mp4" "C:\path\to\output" --quality normal
 ```
 
 | Quality | Use |
@@ -62,6 +63,35 @@ Matte, textured objects work best. Shiny, transparent or plain surfaces reconstr
 
 Supported photo types are JPEG, PNG and TIFF. Convert iPhone HEIC photos to JPEG first.
 
+Resolution is rarely the problem, and most phones are more than good enough. Results depend on moving around one subject. Turning on the spot to photograph a whole room won't work, and screens, glass and plain walls give COLMAP little to match.
+
+## Using a video
+
+You can use a video instead of a photo folder. In the window, click **Video...**. On the command line, give the video file in place of the folder. Supported types are MP4, MOV, M4V, MKV, AVI and WebM.
+
+The program splits the video into equal parts and keeps the sharpest frame from each. It uses 100 frames unless you change **Video frames** in the window or add `--frames`. More frames take longer, because every frame is compared with every other. A rerun can't continue with a different frame count, so tick **Start over** or add `--restart` when you change it.
+
+Video input has only been tested on videos rendered in Blender, not on real phone footage yet. Photos should still give better models, because a video frame holds less detail than a photo. To get the most from a video:
+
+1. Film a slow, full circle of 30 to 60 seconds around the object, then another from higher up.
+2. Use the highest resolution your camera offers, in standard video rather than HDR.
+3. Lock focus and exposure if your camera allows it.
+4. Turn stabilization off if you can.
+5. Use bright, steady light, so frames stay sharp while the camera moves.
+
+## Photo check
+
+Right after camera solving, the program checks four signs of a weak photo set:
+
+| Sign | Limit |
+|---|---|
+| Matched points per photo | At least 300 |
+| Photos sharing each point | At least 3.5 |
+| Position error | At most 1 pixel |
+| Viewing angle around the subject | At least 45 degrees |
+
+If two or more signs fail, the run stops before the long dense stage and lists the reasons. Video frames get the same check. The window then asks whether to continue anyway. On the command line, add `--accept-weak-photos`. The limits come from only two photo sets so far, so a good set could occasionally be stopped. The numbers are saved as `photo_check` in `run_report.json`.
+
 ## Speed
 
 Measured on a Core Ultra 9 285K with 95 GB of RAM and an RX 7800 XT, using the 11-photo Sceaux Castle sample:
@@ -73,6 +103,8 @@ Measured on a Core Ultra 9 285K with 95 GB of RAM and an RX 7800 XT, using the 1
 | High | 9 minutes 18 seconds | 9 minutes 47 seconds |
 
 More photos take longer, and matching time grows quickly because every photo is compared with every other.
+
+Picking frames from a video takes seconds, even for a 60-second 4K clip. The rest depends on the frames: 100 frames at 1280 x 720 took about 10 minutes at Normal, and larger frames take longer.
 
 ## GPU mode (experimental, AMD on Windows)
 
@@ -100,6 +132,9 @@ In the window, tick **Use graphics card**. `dense_device` in `run_report.json` s
 | Problem | What to try |
 |---|---|
 | "could not work out where the photos were taken from" | Take more photos with more overlap, and avoid plain or shiny subjects |
+| "These photos look too weak for a good model" | Retake them around one matte, textured object, using the steps in Taking the photos |
+| "These video frames look too weak for a good model" | Film again, using the steps in Using a video |
+| "Video input needs ffmpeg" | Run `python setup_tools.py` |
 | Only some photos are placed | Add photos that bridge the gaps between the parts that were placed |
 | Colour seams on the model | Keep lighting and exposure the same between photos. See the note below |
 | Details are missing | Use High, try GPU mode, and add close-up photos of those parts |

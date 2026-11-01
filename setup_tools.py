@@ -1,4 +1,4 @@
-"""Download the pinned COLMAP and OpenMVS Windows builds and record their paths."""
+"""Download the pinned COLMAP, OpenMVS and ffmpeg Windows builds and record their paths."""
 
 import argparse
 import hashlib
@@ -29,6 +29,12 @@ CPU_TOOLS = {
         "url": "https://github.com/cdcseacave/openMVS/releases/download/v2.4.0/OpenMVS_Windows_x64.zip",
         "sha256": "0c31660c15c9ebc4c106873cf67564d9570d404aef7a6403451da1b6178b2167",
         "exe": "DensifyPointCloud.exe",
+    },
+    "ffmpeg": {
+        "version": "9.0.2",
+        "url": "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip",
+        "sha256": "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba",
+        "exe": "ffmpeg.exe",
     },
 }
 

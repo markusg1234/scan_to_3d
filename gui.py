@@ -8,11 +8,14 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from pipeline import (
+    DEFAULT_VIDEO_FRAMES,
     QUALITIES,
     STAGE_TITLES,
+    VIDEO_EXTENSIONS,
     Cancelled,
     Pipeline,
     PipelineError,
+    WeakPhotos,
     format_duration,
     has_gpu_tools,
     load_tools,
@@ -28,8 +31,8 @@ STATUS_TEXT = {
 }
 
 
-def existing_folder(path):
-    return path if isinstance(path, str) and os.path.isdir(path) else ""
+def existing_path(path):
+    return path if isinstance(path, str) and os.path.exists(path) else ""
 
 
 class App(tk.Tk):
@@ -37,7 +40,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Photo to 3D")
         self.geometry("820x660")
-        self.minsize(620, 520)
+        self.minsize(660, 520)
         self.events = queue.Queue()
         self.pipeline = None
         self.closing = False
@@ -47,11 +50,13 @@ class App(tk.Tk):
         self.running_stage = None
         self.stage_started = None
         settings = load_settings()
-        self.photos = tk.StringVar(value=existing_folder(settings.get("photos")))
-        self.output = tk.StringVar(value=existing_folder(settings.get("output")))
+        self.photos = tk.StringVar(value=existing_path(settings.get("photos")))
+        self.output = tk.StringVar(value=existing_path(settings.get("output")))
         self.quality = tk.StringVar(value="normal")
         self.gpu = tk.BooleanVar(value=False)
         self.restart = tk.BooleanVar(value=False)
+        # Saved because resuming a video run needs the same frame count.
+        self.frames = tk.StringVar(value=str(settings.get("frames", DEFAULT_VIDEO_FRAMES)))
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(POLL_MILLISECONDS, self._process_events)
@@ -61,7 +66,7 @@ class App(tk.Tk):
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
         for row, (label, variable, title) in enumerate((
-            ("Photo folder", self.photos, "Choose the photo folder"),
+            ("Photos or video", self.photos, "Choose the photo folder"),
             ("Output folder", self.output, "Choose where to save the model"),
         )):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=3)
@@ -71,10 +76,13 @@ class App(tk.Tk):
                 text="Browse...",
                 command=lambda variable=variable, title=title: self._browse(variable, title),
             ).grid(row=row, column=2)
+        ttk.Button(form, text="Video...", command=self._browse_video).grid(
+            row=0, column=3, padx=(6, 0)
+        )
 
         ttk.Label(form, text="Quality").grid(row=2, column=0, sticky="w", pady=3)
         options = ttk.Frame(form)
-        options.grid(row=2, column=1, columnspan=2, sticky="w", padx=8)
+        options.grid(row=2, column=1, columnspan=3, sticky="w", padx=8)
         ttk.Combobox(
             options, textvariable=self.quality, values=list(QUALITIES), state="readonly", width=10
         ).pack(side="left")
@@ -85,6 +93,10 @@ class App(tk.Tk):
         ttk.Checkbutton(options, text="Start over", variable=self.restart).pack(
             side="left", padx=(14, 0)
         )
+        ttk.Label(options, text="Video frames").pack(side="left", padx=(14, 4))
+        ttk.Spinbox(
+            options, textvariable=self.frames, from_=20, to=500, increment=10, width=5
+        ).pack(side="left")
         if not self._gpu_available():
             self.gpu_check.state(["disabled"])
 
@@ -131,18 +143,37 @@ class App(tk.Tk):
             return False
 
     def _browse(self, variable, title):
-        start_in = variable.get() or self.photos.get() or self.output.get()
-        folder = filedialog.askdirectory(title=title, initialdir=start_in or None)
+        folder = filedialog.askdirectory(title=title, initialdir=self._start_folder(variable))
         if folder:
             variable.set(os.path.normpath(folder))
             self._save_folders()
 
-    def _save_folders(self):
-        save_settings({"photos": self.photos.get(), "output": self.output.get()})
+    def _browse_video(self):
+        patterns = tuple(f"*{extension}" for extension in sorted(VIDEO_EXTENSIONS))
+        video = filedialog.askopenfilename(
+            title="Choose a video",
+            initialdir=self._start_folder(self.photos),
+            filetypes=[("Video files", patterns)],
+        )
+        if video:
+            self.photos.set(os.path.normpath(video))
+            self._save_folders()
 
-    def start(self):
+    def _start_folder(self, variable):
+        path = variable.get() or self.photos.get() or self.output.get()
+        return (os.path.dirname(path) if os.path.isfile(path) else path) or None
+
+    def _save_folders(self):
+        save_settings(
+            {"photos": self.photos.get(), "output": self.output.get(), "frames": self.frames.get()}
+        )
+
+    def start(self, accept_weak_photos=False):
         if not self.photos.get() or not self.output.get():
-            messagebox.showinfo("Photo to 3D", "Choose a photo folder and an output folder first.")
+            messagebox.showinfo("Photo to 3D", "Choose photos or a video, and an output folder first.")
+            return
+        if not self.frames.get().isdecimal():
+            messagebox.showinfo("Photo to 3D", "Video frames must be a whole number.")
             return
         self._save_folders()
         for stage in STAGE_TITLES:
@@ -161,6 +192,8 @@ class App(tk.Tk):
             quality=self.quality.get(),
             gpu=self.gpu.get(),
             restart=self.restart.get(),
+            accept_weak_photos=accept_weak_photos,
+            video_frames=int(self.frames.get()),
             on_log=lambda line: self.events.put(("log", line)),
             on_stage=lambda stage, status: self.events.put(("stage", stage, status)),
         )
@@ -174,6 +207,8 @@ class App(tk.Tk):
             self.events.put(("finished", pipeline.run()))
         except Cancelled as error:
             self.events.put(("cancelled", str(error)))
+        except WeakPhotos as error:
+            self.events.put(("weak_photos", str(error)))
         except PipelineError as error:
             self.events.put(("failed", str(error)))
         except Exception as error:
@@ -262,6 +297,16 @@ class App(tk.Tk):
     def _on_cancelled(self, message):
         self._finish_run()
         self._on_log(message)
+
+    def _on_weak_photos(self, message):
+        self._finish_run()
+        self._on_log(message)
+        if not self.closing and messagebox.askyesno(
+            "Photo to 3D", f"{message}\n\nContinue anyway?"
+        ):
+            # Start Over already ran, and the finished stages should be kept.
+            self.restart.set(False)
+            self.start(accept_weak_photos=True)
 
     def _on_failed(self, message):
         self._finish_run()

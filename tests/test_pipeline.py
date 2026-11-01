@@ -1,20 +1,32 @@
 import json
+import math
+import re
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 
 from pipeline import (
     NO_PLACEMENT_HELP,
+    WEAK_VIDEO_HELP,
     Pipeline,
     PipelineError,
     ToolResult,
+    WeakPhotos,
     format_duration,
+    parse_blur_scores,
+    parse_model_stats,
     parse_registered_images,
+    photo_problems,
+    pick_sharpest,
+    read_camera_centers,
+    viewing_angle,
 )
 
 TOOLS = {
     "colmap": {"version": "1", "bin": "colmap_bin"},
     "openmvs": {"version": "2", "bin": "openmvs_bin"},
+    "ffmpeg": {"version": "4", "exe": "ffmpeg.exe"},
 }
 GPU_TOOLS = {
     **TOOLS,
@@ -22,16 +34,39 @@ GPU_TOOLS = {
 }
 ALL_BEFORE_DENSIFY = ["features", "matching", "mapping", "select_model", "undistort", "import"]
 DENSIFY_ONWARD = ["densify", "mesh", "texture"]
+WEAK_STATS = "Points: 700\nMean track length: 3.04\nMean reprojection error: 1.26"
+ONE_WEAK_SIGN_STATS = "Points: 3600\nMean track length: 3.04\nMean reprojection error: 0.54"
+
+
+def blur_text(scores):
+    """Write scores the way ffmpeg's metadata filter does."""
+    lines = []
+    for frame, score in enumerate(scores):
+        lines.append(f"frame:{frame:<4} pts:{frame * 512:<7} pts_time:{frame / 30}")
+        lines.append(f"lavfi.blur={score}")
+    return "\n".join(lines) + "\n"
 
 
 class FakeRunner:
     """Stands in for ToolRunner: records commands and creates the files tools would."""
 
-    def __init__(self, models=None, fail_stage=None, fail_output="first line\nsecond line", mapper_exit=0):
+    def __init__(
+        self,
+        models=None,
+        fail_stage=None,
+        fail_output="first line\nsecond line",
+        mapper_exit=0,
+        analyzer_stats="",
+        blur_scores=(5.0, 4.0, 3.0, 2.0, 1.0, 5.0, 4.0, 3.0, 2.0, 1.0),
+        lost_frames=0,
+    ):
         self.models = {"0": 5} if models is None else models
         self.fail_stage = fail_stage
         self.fail_output = fail_output
         self.mapper_exit = mapper_exit
+        self.analyzer_stats = analyzer_stats
+        self.blur_scores = blur_scores
+        self.lost_frames = lost_frames
         self.stages = []
         self.commands = {}
         self.calls = []
@@ -45,16 +80,28 @@ class FakeRunner:
         self.calls.append((stage, command, env))
         if stage == self.fail_stage:
             return ToolResult(3, self.fail_output)
+        if stage == "frames":
+            self._write_video_files(command)
+            return ToolResult(0, "")
         if stage == "mapping":
             for name in self.models:
                 (self.output_dir / "work" / "sparse" / name).mkdir()
             return ToolResult(self.mapper_exit, "")
         if stage == "select_model":
             name = command[-1].split("/")[-1]
-            return ToolResult(0, f"Registered images: {self.models[name]}")
+            return ToolResult(0, f"Registered images: {self.models[name]}\n{self.analyzer_stats}")
         if stage == "texture":
             (self.output_dir / "model" / "model.obj").write_text("v 0 0 0\n")
         return ToolResult(0, "")
+
+    def _write_video_files(self, command):
+        work = self.output_dir / "work"
+        if command[-1] == "-":
+            (work / "blur.txt").write_text(blur_text(self.blur_scores), encoding="utf-8")
+            return
+        picked = re.findall(r"eq\(n,(\d+)\)", (work / "select.txt").read_text(encoding="utf-8"))
+        for number in range(1, len(picked) - self.lost_frames + 1):
+            (work / "frames" / f"frame_{number:04}.jpg").write_bytes(b"frame")
 
 
 class PipelineTestCase(unittest.TestCase):
@@ -269,13 +316,285 @@ class GpuTests(PipelineTestCase):
             self.run_pipeline(runner, gpu=True, tools=GPU_TOOLS)
 
 
+class PhotoCheckTests(PipelineTestCase):
+    def test_weak_photos_stop_before_the_dense_stage(self):
+        runner = FakeRunner(analyzer_stats=WEAK_STATS)
+        with self.assertRaises(WeakPhotos) as caught:
+            self.run_pipeline(runner)
+        self.assertIn("140 matched points per photo", str(caught.exception))
+        self.assertNotIn("undistort", runner.stages)
+        report = self.saved_report()
+        self.assertEqual(len(report["photo_check"]["problems"]), 3)
+        self.assertNotIn("select_model", report["stages"])
+
+    def test_accepting_weak_photos_keeps_finished_stages_and_warns(self):
+        with self.assertRaises(WeakPhotos):
+            self.run_pipeline(FakeRunner(analyzer_stats=WEAK_STATS))
+        report, runner = self.run_pipeline(
+            FakeRunner(analyzer_stats=WEAK_STATS), accept_weak_photos=True
+        )
+        self.assertEqual(runner.stages, ["select_model", "undistort", "import", *DENSIFY_ONWARD])
+        self.assertTrue(report["finished"])
+        self.assertEqual(len(report["warnings"]), 1)
+        self.assertIn("looked weak", report["warnings"][0])
+
+    def test_running_the_check_twice_does_not_repeat_warnings(self):
+        with self.assertRaises(WeakPhotos):
+            self.run_pipeline(FakeRunner(models={"0": 3}, analyzer_stats=WEAK_STATS))
+        report, _ = self.run_pipeline(
+            FakeRunner(models={"0": 3}, analyzer_stats=WEAK_STATS), accept_weak_photos=True
+        )
+        self.assertEqual(len(report["warnings"]), 2)
+
+    def test_one_weak_sign_does_not_stop_a_run(self):
+        report, _ = self.run_pipeline(FakeRunner(analyzer_stats=ONE_WEAK_SIGN_STATS))
+        self.assertTrue(report["finished"])
+        self.assertEqual(len(report["photo_check"]["problems"]), 1)
+        self.assertEqual(report["warnings"], [])
+
+    def test_missing_numbers_skip_the_check(self):
+        report, _ = self.run_pipeline(FakeRunner())
+        self.assertTrue(report["finished"])
+        self.assertEqual(report["photo_check"]["problems"], [])
+
+    def test_the_castle_passes_and_the_room_photos_fail(self):
+        castle = {"points": 7968, "track_length": 4.81, "error": 0.54}
+        room = {"points": 2107, "track_length": 3.04, "error": 1.26}
+        self.assertEqual(photo_problems(castle, 71, 11), [])
+        self.assertEqual(len(photo_problems(room, 32, 14)), 4)
+
+
+class VideoTests(PipelineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.video = self.root / "orbit.mp4"
+        self.video.write_bytes(b"video")
+
+    def run_video(self, runner=None, **options):
+        runner = runner or FakeRunner()
+        runner.output_dir = self.output.resolve()
+        options.setdefault("tools", TOOLS)
+        options.setdefault("video_frames", 3)
+        return Pipeline(self.video, self.output, runner=runner, **options).run(), runner
+
+    def picked_frames(self):
+        text = (self.output / "work" / "select.txt").read_text(encoding="utf-8")
+        return [int(frame) for frame in re.findall(r"eq\(n,(\d+)\)", text)]
+
+    def test_frames_come_first_and_every_later_stage_reads_them(self):
+        report, runner = self.run_video()
+        self.assertEqual(runner.stages, ["frames", *ALL_BEFORE_DENSIFY, *DENSIFY_ONWARD])
+        frames = str(self.output.resolve() / "work" / "frames")
+        for stage in ("features", "mapping", "undistort"):
+            command = runner.commands[stage]
+            self.assertEqual(command[command.index("--image_path") + 1], frames)
+        self.assertEqual(report["photos_found"], 3)
+        self.assertEqual(report["source"], str(self.video.resolve()))
+
+    def test_photo_runs_have_no_frames_stage(self):
+        _, runner = self.run_pipeline()
+        self.assertNotIn("frames", runner.stages)
+
+    def test_the_sharpest_frame_of_each_slice_is_extracted(self):
+        self.run_video()
+        self.assertEqual(self.picked_frames(), [2, 4, 9])
+
+    def test_the_video_goes_to_ffmpeg_in_both_passes(self):
+        _, runner = self.run_video()
+        passes = [command for stage, command, _ in runner.calls if stage == "frames"]
+        self.assertEqual(len(passes), 2)
+        for command in passes:
+            self.assertEqual(command[command.index("-i") + 1], str(self.video.resolve()))
+        self.assertEqual(passes[1][-1], "frames/frame_%04d.jpg")
+
+    def test_one_camera_is_solved_for_a_video_only(self):
+        _, video_runner = self.run_video()
+        self.assertIn("--ImageReader.single_camera", video_runner.commands["features"])
+        _, photo_runner = self.run_pipeline(restart=True)
+        self.assertNotIn("--ImageReader.single_camera", photo_runner.commands["features"])
+
+    def test_a_short_video_uses_every_frame_and_warns(self):
+        report, _ = self.run_video(FakeRunner(blur_scores=(3.0, 2.0, 1.0, 2.0)), video_frames=100)
+        self.assertEqual(self.picked_frames(), [0, 1, 2, 3])
+        self.assertIn("only 4 frames", report["warnings"][0])
+
+    def test_a_video_with_too_few_frames_is_refused(self):
+        with self.assertRaisesRegex(PipelineError, "only 2 frames"):
+            self.run_video(FakeRunner(blur_scores=(1.0, 2.0)))
+
+    def test_missing_frames_are_an_error(self):
+        with self.assertRaisesRegex(PipelineError, "wrote 4 frames from the video instead of 5"):
+            self.run_video(FakeRunner(lost_frames=1), video_frames=5)
+        self.assertNotIn("frames", self.saved_report()["stages"])
+
+    def test_too_few_frames_asked_for_are_refused(self):
+        with self.assertRaisesRegex(PipelineError, "at least 3"):
+            self.run_video(video_frames=2)
+
+    def test_other_file_types_are_refused(self):
+        photo = self.root / "photo.jpg"
+        photo.write_bytes(b"photo")
+        with self.assertRaisesRegex(PipelineError, "not a supported video type"):
+            Pipeline(photo, self.output, tools=TOOLS, runner=FakeRunner()).run()
+
+    def test_video_needs_ffmpeg_installed(self):
+        tools = {name: tool for name, tool in TOOLS.items() if name != "ffmpeg"}
+        with self.assertRaisesRegex(PipelineError, "python setup_tools.py"):
+            self.run_video(tools=tools)
+
+    def test_ffmpeg_failure_names_the_stage(self):
+        with self.assertRaisesRegex(PipelineError, "Extract video frames failed"):
+            self.run_video(FakeRunner(fail_stage="frames"))
+
+    def test_rerun_after_a_failure_starts_the_frames_again(self):
+        with self.assertRaises(PipelineError):
+            self.run_video(FakeRunner(lost_frames=1), video_frames=5)
+        stale = self.output / "work" / "frames" / "stale.jpg"
+        stale.write_bytes(b"old")
+        _, runner = self.run_video(video_frames=5)
+        self.assertEqual(runner.stages[0], "frames")
+        self.assertFalse(stale.exists())
+
+    def test_finished_frames_are_not_extracted_again(self):
+        with self.assertRaises(PipelineError):
+            self.run_video(FakeRunner(fail_stage="densify"))
+        _, runner = self.run_video()
+        self.assertEqual(runner.stages, DENSIFY_ONWARD)
+
+    def test_quality_change_keeps_the_frames(self):
+        self.run_video(quality="draft")
+        report, runner = self.run_video(quality="normal")
+        self.assertEqual(runner.stages, DENSIFY_ONWARD)
+        self.assertEqual(report["photos_found"], 3)
+
+    def test_a_changed_frame_count_is_refused(self):
+        self.run_video()
+        with self.assertRaisesRegex(PipelineError, "frame count"):
+            self.run_video(video_frames=4)
+
+    def test_a_changed_video_is_refused(self):
+        self.run_video()
+        self.video.write_bytes(b"a longer video")
+        with self.assertRaisesRegex(PipelineError, "different"):
+            self.run_video()
+
+    def test_restart_extracts_the_frames_again(self):
+        self.run_video()
+        _, runner = self.run_video(video_frames=4, restart=True)
+        self.assertEqual(runner.stages[0], "frames")
+
+    def test_weak_frames_get_advice_about_filming(self):
+        with self.assertRaises(WeakPhotos) as caught:
+            self.run_video(FakeRunner(models={"0": 10}, analyzer_stats=WEAK_STATS))
+        self.assertIn("These video frames look too weak", str(caught.exception))
+        self.assertIn(WEAK_VIDEO_HELP, str(caught.exception))
+
+
+class ViewingAngleTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+
+    def write_images(self, poses):
+        data = struct.pack("<Q", len(poses))
+        for index, (rotation, translation) in enumerate(poses):
+            data += struct.pack("<I7dI", index, *rotation, *translation, 1)
+            data += f"photo{index}.jpg".encode() + b"\0"
+            data += struct.pack("<Q", 2) + bytes(48)
+        (self.folder / "images.bin").write_bytes(data)
+
+    def write_points(self, points):
+        data = struct.pack("<Q", len(points))
+        for index, point in enumerate(points):
+            data += struct.pack("<Q3d3BdQ", index, *point, 0, 0, 0, 0.5, 2) + bytes(16)
+        (self.folder / "points3D.bin").write_bytes(data)
+
+    def test_camera_center_undoes_the_stored_pose(self):
+        half_turn = math.sqrt(0.5)
+        self.write_images([((half_turn, 0, 0, half_turn), (2, -1, -3))])
+        center = read_camera_centers(self.folder / "images.bin")[0]
+        for value, expected in zip(center, (1, 2, 3)):
+            self.assertAlmostEqual(value, expected)
+
+    def test_widest_angle_between_two_cameras(self):
+        identity = (1, 0, 0, 0)
+        self.write_images([(identity, (-5, 0, 0)), (identity, (0, -5, 0)), (identity, (-5, -5, 0))])
+        self.write_points([(0, 0, 0)])
+        self.assertAlmostEqual(viewing_angle(self.folder), 90)
+
+    def test_missing_files_give_no_angle(self):
+        self.assertIsNone(viewing_angle(self.folder))
+
+    def test_damaged_files_give_no_angle(self):
+        (self.folder / "images.bin").write_bytes(struct.pack("<Q", 3) + b"short")
+        self.write_points([(0, 0, 0)])
+        self.assertIsNone(viewing_angle(self.folder))
+
+    def test_a_model_with_no_points_gives_no_angle(self):
+        self.write_images([((1, 0, 0, 0), (-5, 0, 0)), ((1, 0, 0, 0), (0, -5, 0))])
+        self.write_points([])
+        self.assertIsNone(viewing_angle(self.folder))
+
+
 class ParsingTests(unittest.TestCase):
+    def test_model_stats_from_real_log_lines(self):
+        output = (
+            "I20261101 15:26:31.699596 37088 model.cc:440] Registered images: 11\n"
+            "I20261101 15:26:31.700171 37088 model.cc:442] Points: 7968\n"
+            "I20261101 15:26:31.700179 37088 model.cc:443] Observations: 38355\n"
+            "I20261101 15:26:31.700192 37088 model.cc:445] Mean track length: 4.813630\n"
+            "I20261101 15:26:31.700206 37088 model.cc:447] Mean observations per image: 3486.818182\n"
+            "I20261101 15:26:31.700216 37088 model.cc:450] Mean reprojection error: 0.537712px\n"
+        )
+        self.assertEqual(
+            parse_model_stats(output),
+            {"points": 7968, "track_length": 4.81363, "error": 0.537712},
+        )
+
+    def test_missing_model_stats_are_left_out(self):
+        self.assertEqual(parse_model_stats("Registered images: 5"), {})
+
     def test_registered_images_from_a_real_log_line(self):
         line = "I20261101 15:26:31.700163 37088 model.cc:440] Registered images: 11"
         self.assertEqual(parse_registered_images(line), 11)
 
     def test_registered_images_missing(self):
         self.assertEqual(parse_registered_images("nothing useful"), 0)
+
+    def test_blur_scores_from_real_ffmpeg_lines(self):
+        text = (
+            "frame:0    pts:0       pts_time:0\n"
+            "lavfi.blur=5.290438\n"
+            "frame:1    pts:1       pts_time:0.1\n"
+            "lavfi.blur=13.103181\n"
+        )
+        self.assertEqual(parse_blur_scores(text), {0: 5.290438, 1: 13.103181})
+
+    def test_a_black_frame_ranks_last(self):
+        text = "frame:0    pts:0       pts_time:0\nlavfi.blur=nan\n"
+        self.assertEqual(parse_blur_scores(text), {0: math.inf})
+
+    def test_no_blur_scores(self):
+        self.assertEqual(parse_blur_scores(""), {})
+
+    def test_sharpest_frame_is_picked_from_each_equal_slice(self):
+        scores = dict(enumerate([3, 1, 2, 9, 8, 7, 4, 6, 5]))
+        self.assertEqual(pick_sharpest(scores, 3), [1, 5, 6])
+
+    def test_slices_cover_every_frame_when_they_do_not_divide_evenly(self):
+        scores = dict(enumerate([9, 9, 9, 9, 9, 9, 9, 1]))
+        self.assertEqual(pick_sharpest(scores, 3)[-1], 7)
+
+    def test_a_frame_with_no_score_is_only_picked_if_its_slice_has_nothing_else(self):
+        scores = {0: math.inf, 1: 5.0, 2: math.inf, 3: math.inf}
+        self.assertEqual(pick_sharpest(scores, 2), [1, 2])
+
+    def test_every_frame_is_used_when_too_few_exist(self):
+        self.assertEqual(pick_sharpest({0: 1.0, 1: 2.0}, 100), [0, 1])
+
+    def test_picking_from_no_frames_gives_nothing(self):
+        self.assertEqual(pick_sharpest({}, 10), [])
 
     def test_durations_read_like_a_clock(self):
         self.assertEqual(format_duration(0), "0:00")

@@ -4,7 +4,15 @@ import argparse
 import sys
 import time
 
-from pipeline import QUALITIES, STAGE_TITLES, Pipeline, PipelineError, format_duration
+from pipeline import (
+    DEFAULT_VIDEO_FRAMES,
+    QUALITIES,
+    STAGE_TITLES,
+    Pipeline,
+    PipelineError,
+    WeakPhotos,
+    format_duration,
+)
 
 
 def print_stage(stage, status):
@@ -12,27 +20,43 @@ def print_stage(stage, status):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Turn a folder of photos into a textured 3D model.")
-    parser.add_argument("photos", help="folder of photos")
+    parser = argparse.ArgumentParser(
+        description="Turn a folder of photos or a video into a textured 3D model."
+    )
+    parser.add_argument("source", help="folder of photos, or a video file")
     parser.add_argument("output", help="folder for the model and working files")
     parser.add_argument("--quality", choices=QUALITIES, default="normal")
     parser.add_argument("--gpu", action="store_true", help="use the graphics card (experimental)")
     parser.add_argument("--restart", action="store_true", help="discard earlier progress")
+    parser.add_argument(
+        "--accept-weak-photos", action="store_true", help="continue if the photo check fails"
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=DEFAULT_VIDEO_FRAMES,
+        help=f"how many frames to use from a video (default {DEFAULT_VIDEO_FRAMES})",
+    )
     parser.add_argument("--verbose", action="store_true", help="show tool output")
     args = parser.parse_args()
 
     pipeline = Pipeline(
-        args.photos,
+        args.source,
         args.output,
         quality=args.quality,
         gpu=args.gpu,
         restart=args.restart,
+        accept_weak_photos=args.accept_weak_photos,
+        video_frames=args.frames,
         on_log=print if args.verbose else lambda line: None,
         on_stage=print_stage,
     )
     started = time.monotonic()
     try:
         report = pipeline.run()
+    except WeakPhotos as error:
+        print(f"\nStopped: {error}\nTo continue anyway, add --accept-weak-photos.", file=sys.stderr)
+        return 1
     except PipelineError as error:
         print(f"\nStopped: {error}", file=sys.stderr)
         return 1
