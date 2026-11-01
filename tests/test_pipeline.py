@@ -8,7 +8,6 @@ from pipeline import (
     Pipeline,
     PipelineError,
     ToolResult,
-    parse_gpu_name,
     parse_registered_images,
 )
 
@@ -18,32 +17,33 @@ TOOLS = {
 }
 GPU_TOOLS = {
     **TOOLS,
-    "openmvs_gpu": {"version": "2", "bin": "openmvs_gpu_bin"},
-    "zluda": {"version": "3", "exe": "zluda.exe"},
+    "colmap_gpu": {"version": "3", "exe": "colmap_gpu.exe", "dll_paths": ["gpu_dlls"]},
 }
 ALL_BEFORE_DENSIFY = ["features", "matching", "mapping", "select_model", "undistort", "import"]
 DENSIFY_ONWARD = ["densify", "mesh", "texture"]
-GPU_LOG = "CUDA device 0 initialized: AMD Radeon RX 7800 XT (compute capability 8.8; memory 16GB)"
 
 
 class FakeRunner:
     """Stands in for ToolRunner: records commands and creates the files tools would."""
 
-    def __init__(self, models=None, fail_stage=None, densify_output="", mapper_exit=0):
+    def __init__(self, models=None, fail_stage=None, fail_output="first line\nsecond line", mapper_exit=0):
         self.models = {"0": 5} if models is None else models
         self.fail_stage = fail_stage
-        self.densify_output = densify_output
+        self.fail_output = fail_output
         self.mapper_exit = mapper_exit
         self.stages = []
         self.commands = {}
+        self.calls = []
         self.output_dir = None
 
-    def run(self, stage, command, tool_log=None):
+    def run(self, stage, command, tool_log=None, env=None):
         command = [str(part) for part in command]
-        self.stages.append(stage)
+        if not self.stages or self.stages[-1] != stage:
+            self.stages.append(stage)
         self.commands[stage] = command
+        self.calls.append((stage, command, env))
         if stage == self.fail_stage:
-            return ToolResult(3, "first line\nsecond line")
+            return ToolResult(3, self.fail_output)
         if stage == "mapping":
             for name in self.models:
                 (self.output_dir / "work" / "sparse" / name).mkdir()
@@ -51,8 +51,6 @@ class FakeRunner:
         if stage == "select_model":
             name = command[-1].split("/")[-1]
             return ToolResult(0, f"Registered images: {self.models[name]}")
-        if stage == "densify":
-            return ToolResult(0, self.densify_output)
         if stage == "texture":
             (self.output_dir / "model" / "model.obj").write_text("v 0 0 0\n")
         return ToolResult(0, "")
@@ -207,11 +205,11 @@ class FolderTests(PipelineTestCase):
 
     def test_missing_model_file_is_an_error(self):
         class NoModelRunner(FakeRunner):
-            def run(self, stage, command, tool_log=None):
+            def run(self, stage, command, tool_log=None, env=None):
                 if stage == "texture":
                     self.stages.append(stage)
                     return ToolResult(0, "")
-                return super().run(stage, command, tool_log)
+                return super().run(stage, command, tool_log, env)
 
         with self.assertRaisesRegex(PipelineError, "missing or empty"):
             self.run_pipeline(NoModelRunner())
@@ -222,34 +220,52 @@ class GpuTests(PipelineTestCase):
         with self.assertRaisesRegex(PipelineError, "setup_tools.py --gpu"):
             self.run_pipeline(gpu=True)
 
-    def test_gpu_stages_run_through_the_launcher(self):
-        report, runner = self.run_pipeline(
-            FakeRunner(densify_output=GPU_LOG), gpu=True, tools=GPU_TOOLS, quality="high"
+    def test_dense_stage_runs_on_the_card_then_hands_over_to_openmvs(self):
+        report, runner = self.run_pipeline(gpu=True, tools=GPU_TOOLS)
+        densify = [call for call in runner.calls if call[0] == "densify"]
+        self.assertEqual(
+            [command[:2] for _, command, _ in densify[:2]],
+            [["colmap_gpu.exe", "patch_match_stereo"], ["colmap_gpu.exe", "stereo_fusion"]],
         )
-        for stage in ("densify", "refine"):
-            command = runner.commands[stage]
-            self.assertEqual(command[:2], ["zluda.exe", "--"])
-            self.assertIn("openmvs_gpu_bin", command[2])
-            self.assertEqual(command[-2:], ["--cuda-device", "-1"])
-        self.assertIn("openmvs_bin", runner.commands["mesh"][0])
+        self.assertTrue(densify[0][2]["PATH"].startswith("gpu_dlls"))
+        handover = densify[2][1]
+        self.assertIn("InterfaceCOLMAP", handover[0])
+        self.assertEqual(handover[handover.index("-p") + 1], "dense/fused.ply")
+        self.assertEqual(handover[handover.index("-o") + 1], "scene_dense.mvs")
+        self.assertEqual(report["dense_device"], "GPU")
+
+    def test_image_size_follows_the_quality_setting(self):
+        for quality, size in (("draft", "1000"), ("normal", "2000"), ("high", "-1")):
+            with self.subTest(quality=quality):
+                _, runner = self.run_pipeline(gpu=True, tools=GPU_TOOLS, quality=quality, restart=True)
+                command = next(c for s, c, _ in runner.calls if "patch_match_stereo" in c)
+                self.assertEqual(command[command.index("--PatchMatchStereo.max_image_size") + 1], size)
+
+    def test_source_photos_per_view_are_limited(self):
+        _, runner = self.run_pipeline(gpu=True, tools=GPU_TOOLS)
+        command = runner.commands["undistort"]
+        self.assertEqual(command[command.index("--num_patch_match_src_images") + 1], "10")
+
+    def test_other_stages_stay_on_the_cpu(self):
+        _, runner = self.run_pipeline(gpu=True, tools=GPU_TOOLS, quality="high")
         self.assertIn("colmap_bin", runner.commands["features"][0])
-        self.assertEqual(report["dense_device"], "AMD Radeon RX 7800 XT")
-        self.assertEqual(report["warnings"], [])
+        for stage in ("mesh", "refine", "texture"):
+            self.assertIn("openmvs_bin", runner.commands[stage][0])
 
-    def test_cpu_fallback_is_reported(self):
-        report, _ = self.run_pipeline(FakeRunner(), gpu=True, tools=GPU_TOOLS)
-        self.assertEqual(report["dense_device"], "CPU")
-        self.assertIn("ran on the CPU", report["warnings"][0])
-
-    def test_cpu_mode_does_not_use_the_launcher(self):
-        report, runner = self.run_pipeline(FakeRunner())
-        self.assertIn("openmvs_bin", runner.commands["densify"][0])
+    def test_cpu_mode_does_not_use_the_card(self):
+        report, runner = self.run_pipeline(tools=GPU_TOOLS)
+        self.assertIn("DensifyPointCloud", runner.commands["densify"][0])
         self.assertEqual(report["dense_device"], "CPU")
 
     def test_switching_to_gpu_reruns_the_dense_stages(self):
         self.run_pipeline(tools=GPU_TOOLS)
-        _, runner = self.run_pipeline(FakeRunner(densify_output=GPU_LOG), gpu=True, tools=GPU_TOOLS)
+        _, runner = self.run_pipeline(gpu=True, tools=GPU_TOOLS)
         self.assertEqual(runner.stages, DENSIFY_ONWARD)
+
+    def test_running_out_of_memory_suggests_a_lower_quality(self):
+        runner = FakeRunner(fail_stage="densify", fail_output="CUDA error - out of memory")
+        with self.assertRaisesRegex(PipelineError, "Try a lower quality"):
+            self.run_pipeline(runner, gpu=True, tools=GPU_TOOLS)
 
 
 class ParsingTests(unittest.TestCase):
@@ -259,10 +275,6 @@ class ParsingTests(unittest.TestCase):
 
     def test_registered_images_missing(self):
         self.assertEqual(parse_registered_images("nothing useful"), 0)
-
-    def test_gpu_name(self):
-        self.assertEqual(parse_gpu_name(GPU_LOG), "AMD Radeon RX 7800 XT")
-        self.assertIsNone(parse_gpu_name("no device line"))
 
 
 if __name__ == "__main__":

@@ -32,21 +32,10 @@ CPU_TOOLS = {
     },
 }
 
-# OpenMVS only has CUDA GPU code. ZLUDA runs CUDA programs on AMD graphics cards.
-GPU_TOOLS = {
-    "openmvs_gpu": {
-        "version": "2.4.0",
-        "url": "https://github.com/cdcseacave/openMVS/releases/download/v2.4.0/OpenMVS_Windows_x64_CUDA.7z",
-        "sha256": "6aac6b14ef478e501d2514cd1d74ed20e659b53b3bc2835d45a473ddfb921621",
-        "exe": "DensifyPointCloud.exe",
-    },
-    "zluda": {
-        "version": "v7-preview.19",
-        "url": "https://github.com/vosen/ZLUDA/releases/download/v7-preview.19/zluda-windows-08b19b2.zip",
-        "sha256": "ce4f662ef9cb7ae8a3b7d6864c5c35af3c46d857b8ea896723c7f4546fd19952",
-        "exe": "zluda.exe",
-    },
-}
+# COLMAP has no AMD GPU download, so gpu/build_colmap_hip.ps1 compiles it here.
+DEFAULT_GPU_BUILD = Path.home() / "colmap-hip"
+GPU_VERSION = "4.2.1"
+RETIRED_TOOLS = ("openmvs_gpu", "zluda")
 
 
 def download(url, destination, expected_sha256):
@@ -81,7 +70,6 @@ def install(name, spec):
 
 
 def find_exe(folder, name):
-    # ZLUDA also ships 32-bit tools in a subfolder, so the shallowest match wins.
     exe = min(folder.rglob(name), key=lambda path: len(path.parts), default=None)
     if exe is None:
         raise SystemExit(f"{name} was not found under {folder}.")
@@ -96,17 +84,50 @@ def check_starts(name, exe):
         raise SystemExit(f"{name} failed to start (exit code {result.returncode}).")
 
 
+def find_openmp_folder():
+    """Find the OpenMP runtime that Visual Studio installs but does not put on PATH."""
+    studio = Path(os.environ["ProgramFiles(x86)"]) / "Microsoft Visual Studio"
+    matches = sorted(studio.glob("*/*/VC/Redist/MSVC/*/*/x64/Microsoft.VC*.OpenMP.LLVM/libomp140.x86_64.dll"))
+    if not matches:
+        raise SystemExit("libomp140.x86_64.dll was not found. Install Visual Studio Build Tools.")
+    return matches[-1].parent
+
+
+def register_gpu_build(folder):
+    """Check a local COLMAP build has AMD GPU support and return its tools entry."""
+    exe = folder / "build2" / "src" / "colmap" / "exe" / "colmap.exe"
+    if not exe.exists():
+        raise SystemExit(f"No COLMAP GPU build in {folder}. See gpu/README.md.")
+    dll_paths = [str(folder / "vi" / "x64-windows" / "bin"), str(find_openmp_folder())]
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([*dll_paths, env["PATH"]])
+    result = subprocess.run([exe, "-h"], capture_output=True, text=True, env=env)
+    if "with HIP" not in result.stdout + result.stderr:
+        raise SystemExit(f"{exe} does not report AMD GPU support (exit code {result.returncode}).")
+    return {"version": GPU_VERSION, "bin": str(exe.parent), "exe": str(exe), "dll_paths": dll_paths}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gpu", action="store_true", help="also download the AMD GPU tools")
+    parser.add_argument(
+        "--gpu",
+        nargs="?",
+        const=DEFAULT_GPU_BUILD,
+        type=Path,
+        metavar="FOLDER",
+        help=f"also use the local COLMAP GPU build (default folder: {DEFAULT_GPU_BUILD})",
+    )
     args = parser.parse_args()
 
     tools = json.loads(TOOLS_JSON.read_text(encoding="utf-8")) if TOOLS_JSON.exists() else {}
-    for name, spec in {**CPU_TOOLS, **(GPU_TOOLS if args.gpu else {})}.items():
+    for name in RETIRED_TOOLS:
+        tools.pop(name, None)
+    for name, spec in CPU_TOOLS.items():
         exe = find_exe(install(name, spec), spec["exe"])
-        if name in CPU_TOOLS:
-            check_starts(name, exe)
+        check_starts(name, exe)
         tools[name] = {"version": spec["version"], "bin": str(exe.parent), "exe": str(exe)}
+    if args.gpu:
+        tools["colmap_gpu"] = register_gpu_build(args.gpu)
     TOOLS_JSON.write_text(json.dumps(tools, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {TOOLS_JSON}")
 

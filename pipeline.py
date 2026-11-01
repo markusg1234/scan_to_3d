@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -31,14 +32,15 @@ NO_PLACEMENT_HELP = (
 class Quality:
     resolution_level: int
     max_resolution: int
+    gpu_image_size: int
     refine: bool
 
 
 QUALITIES = {
-    "draft": Quality(resolution_level=2, max_resolution=2560, refine=False),
-    "normal": Quality(resolution_level=1, max_resolution=2560, refine=False),
-    # OpenMVS caps images at 2560 pixels unless told otherwise.
-    "high": Quality(resolution_level=0, max_resolution=16384, refine=True),
+    "draft": Quality(resolution_level=2, max_resolution=2560, gpu_image_size=1000, refine=False),
+    "normal": Quality(resolution_level=1, max_resolution=2560, gpu_image_size=2000, refine=False),
+    # OpenMVS caps images at 2560 pixels unless told otherwise. -1 is COLMAP's full size.
+    "high": Quality(resolution_level=0, max_resolution=16384, gpu_image_size=-1, refine=True),
 }
 
 STAGE_TITLES = {
@@ -103,7 +105,7 @@ class ToolRunner:
         self._process = None
         self._cancelled = threading.Event()
 
-    def run(self, stage, command, tool_log=None):
+    def run(self, stage, command, tool_log=None, env=None):
         """Run a command and return its exit code and output.
 
         OpenMVS prints nothing to a pipe and writes <tool>-<id>.log into its
@@ -127,6 +129,7 @@ class ToolRunner:
             process = subprocess.Popen(
                 [str(part) for part in command],
                 cwd=self.work_dir,
+                env=env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW,
@@ -154,7 +157,6 @@ class ToolRunner:
     @staticmethod
     def _kill(process):
         if process.poll() is None:
-            # The GPU launcher starts the real tool as a child process.
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 capture_output=True,
@@ -178,7 +180,7 @@ def load_tools():
 
 
 def has_gpu_tools(tools):
-    return "openmvs_gpu" in tools and "zluda" in tools
+    return "colmap_gpu" in tools
 
 
 def find_photos(folder):
@@ -200,11 +202,6 @@ def photo_signature(folder, photos):
 def parse_registered_images(analyzer_output):
     match = re.search(r"Registered images:\s*(\d+)", analyzer_output)
     return int(match.group(1)) if match else 0
-
-
-def parse_gpu_name(densify_output):
-    match = re.search(r"CUDA device \d+ initialized: (.+?) \(compute", densify_output)
-    return match.group(1) if match else None
 
 
 class Pipeline:
@@ -344,29 +341,34 @@ class Pipeline:
         self.report["warnings"].append(message)
         self.on_log(f"Warning: {message}")
 
-    def _run(self, stage, command, tool_log=None, check=True):
-        result = self.runner.run(stage, command, tool_log)
+    def _run(self, stage, command, tool_log=None, check=True, env=None):
+        result = self.runner.run(stage, command, tool_log, env)
         if check and result.exit_code != 0:
             raise self._failure(stage, result)
         return result
 
     def _failure(self, stage, result):
         tail = "\n".join(result.output.splitlines()[-LOG_TAIL_LINES:])
+        hint = ""
+        if "out of memory" in result.output:
+            hint = "\nThe graphics card ran out of memory. Try a lower quality."
         return PipelineError(
-            f"{STAGE_TITLES[stage]} failed (exit code {result.exit_code}).\n{tail}"
+            f"{STAGE_TITLES[stage]} failed (exit code {result.exit_code}).{hint}\n{tail}"
         )
 
     def _colmap(self, stage, *args, check=True):
         exe = Path(self.tools["colmap"]["bin"]) / "colmap.exe"
         return self._run(stage, [exe, *args], check=check)
 
-    def _openmvs(self, stage, tool, *args, use_gpu=False):
-        if use_gpu:
-            exe = Path(self.tools["openmvs_gpu"]["bin"]) / f"{tool}.exe"
-            command = [self.tools["zluda"]["exe"], "--", exe, *args, "--cuda-device", "-1"]
-        else:
-            command = [Path(self.tools["openmvs"]["bin"]) / f"{tool}.exe", *args]
-        return self._run(stage, command, tool_log=tool)
+    def _colmap_gpu(self, stage, *args):
+        tool = self.tools["colmap_gpu"]
+        env = dict(os.environ)
+        env["PATH"] = os.pathsep.join([*tool["dll_paths"], env.get("PATH", "")])
+        return self._run(stage, [tool["exe"], *args], env=env)
+
+    def _openmvs(self, stage, tool, *args):
+        exe = Path(self.tools["openmvs"]["bin"]) / f"{tool}.exe"
+        return self._run(stage, [exe, *args], tool_log=tool)
 
     def _stage_features(self):
         self._colmap(
@@ -435,6 +437,8 @@ class Pipeline:
             "--input_path", f"sparse/{best_model}",
             "--output_path", "dense",
             "--output_type", "COLMAP",
+            # Limits GPU dense time on large photo sets. COLMAP's default is 20.
+            "--num_patch_match_src_images", "10",
         )
 
     def _stage_import(self):
@@ -445,24 +449,54 @@ class Pipeline:
         )
 
     def _stage_densify(self):
+        if self.gpu:
+            self._densify_on_gpu()
+        else:
+            self._densify_on_cpu()
+        self.report["dense_device"] = "GPU" if self.gpu else "CPU"
+
+    def _densify_on_cpu(self):
         # OpenMVS would reuse depth maps from an earlier quality setting.
         for depth_map in self.work_dir.glob("*.dmap"):
             depth_map.unlink()
-        result = self._openmvs(
+        self._openmvs(
             "densify",
             "DensifyPointCloud",
             "scene.mvs",
             "--resolution-level", self.quality.resolution_level,
             "--max-resolution", self.quality.max_resolution,
-            use_gpu=self.gpu,
         )
-        gpu_name = parse_gpu_name(result.output) if self.gpu else None
-        self.report["dense_device"] = gpu_name or "CPU"
-        if self.gpu and not gpu_name:
-            self._warn(
-                "GPU mode was requested, but OpenMVS did not report using the graphics "
-                "card, so the dense stage ran on the CPU."
-            )
+
+    def _densify_on_gpu(self):
+        stereo = self.work_dir / "dense" / "stereo"
+        for maps in ("depth_maps", "normal_maps", "consistency_graphs"):
+            shutil.rmtree(stereo / maps, ignore_errors=True)
+            (stereo / maps).mkdir(parents=True)
+        # A sparser window and fewer iterations are about 5 times faster than
+        # COLMAP's defaults, and looked almost the same on the sample photos.
+        self._colmap_gpu(
+            "densify",
+            "patch_match_stereo",
+            "--workspace_path", "dense",
+            "--workspace_format", "COLMAP",
+            "--PatchMatchStereo.geom_consistency", "true",
+            "--PatchMatchStereo.gpu_index", "0",
+            "--PatchMatchStereo.max_image_size", self.quality.gpu_image_size,
+            "--PatchMatchStereo.window_step", "2",
+            "--PatchMatchStereo.num_iterations", "3",
+        )
+        self._colmap_gpu(
+            "densify",
+            "stereo_fusion",
+            "--workspace_path", "dense",
+            "--workspace_format", "COLMAP",
+            "--input_type", "geometric",
+            "--output_path", "dense/fused.ply",
+        )
+        self._openmvs(
+            "densify", "InterfaceCOLMAP", "-i", "dense", "-o", "scene_dense.mvs",
+            "--image-folder", "images", "-p", "dense/fused.ply",
+        )
 
     def _stage_mesh(self):
         self._openmvs("mesh", "ReconstructMesh", "scene_dense.mvs", "-p", "scene_dense.ply")
@@ -476,7 +510,6 @@ class Pipeline:
             "-o", "scene_dense_mesh_refine.mvs",
             "--scales", "1",
             "--max-face-area", "16",
-            use_gpu=self.gpu,
         )
 
     def _stage_texture(self):

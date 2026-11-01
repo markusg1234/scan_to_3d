@@ -62,26 +62,36 @@ Supported photo types are JPEG, PNG and TIFF. Convert iPhone HEIC photos to JPEG
 
 ## Speed
 
-Measured on a Core Ultra 9 285K with 95 GB of RAM, using the 11-photo Sceaux Castle sample and the CPU only:
+Measured on a Core Ultra 9 285K with 95 GB of RAM and an RX 7800 XT, using the 11-photo Sceaux Castle sample:
 
-| Quality | Time |
-|---|---|
-| Draft | About 40 seconds |
-| Normal | About 1.5 minutes |
-| High | About 9 minutes |
+| Quality | CPU | Graphics card |
+|---|---|---|
+| Draft | 35 seconds | 1 minute 40 seconds |
+| Normal | 1 minute 25 seconds | 3 minutes 48 seconds |
+| High | 9 minutes 18 seconds | 9 minutes 47 seconds |
 
 More photos take longer, and matching time grows quickly because every photo is compared with every other.
 
-## GPU mode (experimental, not yet tested)
+## GPU mode (experimental, AMD on Windows)
 
-OpenMVS only has GPU code for NVIDIA CUDA. GPU mode runs its official CUDA build through [ZLUDA](https://github.com/vosen/ZLUDA), a translation layer that runs CUDA programs on AMD cards. It covers the two slowest stages, Dense point cloud and Refine mesh. COLMAP still runs on the CPU.
+GPU mode runs the Dense point cloud stage on an AMD graphics card with COLMAP. OpenMVS still builds the mesh and texture on the CPU.
+
+It's not faster, but on the sample it recovered parts that the CPU route lost, such as a roof turret and stair railings, so it's worth trying when a CPU model is missing detail. It has only been tested on that one sample, on an RX 7800 XT.
+
+| Quality | Image size on the card |
+|---|---|
+| Draft | 1000 pixels |
+| Normal | 2000 pixels |
+| High | Full size, plus mesh refinement on the CPU |
+
+COLMAP has no download with AMD support, so GPU mode needs a local build. See [gpu/README.md](gpu/README.md). After building:
 
 ```
 python setup_tools.py --gpu
-python cli.py "C:\path\to\photos" "C:\path\to\output" --quality draft --gpu
+python cli.py "C:\path\to\photos" "C:\path\to\output" --quality normal --gpu
 ```
 
-ZLUDA is pre-release software, and its documentation also lists the AMD HIP SDK as a requirement. Check `dense_device` in `run_report.json` to see whether the card was really used. If it says CPU, OpenMVS could not reach the card.
+In the window, tick **Use graphics card**. `dense_device` in `run_report.json` shows where the dense stage ran.
 
 ## Troubleshooting
 
@@ -90,7 +100,8 @@ ZLUDA is pre-release software, and its documentation also lists the AMD HIP SDK 
 | "could not work out where the photos were taken from" | Take more photos with more overlap, and avoid plain or shiny subjects |
 | Only some photos are placed | Add photos that bridge the gaps between the parts that were placed |
 | Colour seams on the model | Keep lighting and exposure the same between photos. See the note below |
-| Details are missing | Use High, and add close-up photos of those parts |
+| Details are missing | Use High, try GPU mode, and add close-up photos of those parts |
+| "The graphics card ran out of memory" | Use a lower quality, or close other programs that use the card |
 | The table or room is in the model | Trim it in Blender. Background removal is not included |
 | The model is the wrong size | Models have no real-world scale. Scale it in Blender before 3D printing |
 
