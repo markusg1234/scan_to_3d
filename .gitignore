@@ -2,3 +2,4 @@ __pycache__/
 tools/
 tools.json
 gui_settings.json
+CLAUDE.md
