@@ -199,6 +199,13 @@ def photo_signature(folder, photos):
     return digest.hexdigest()
 
 
+def format_duration(seconds):
+    """Format a duration like a clock: 0:08, 3:48 or 1:02:05."""
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02}:{seconds:02}" if hours else f"{minutes}:{seconds:02}"
+
+
 def parse_registered_images(analyzer_output):
     match = re.search(r"Registered images:\s*(\d+)", analyzer_output)
     return int(match.group(1)) if match else 0

@@ -20,6 +20,8 @@ Open the window:
 python gui.py
 ```
 
+The window shows a running timer and how long each stage took. It also remembers your last photo and output folders in `gui_settings.json`.
+
 Or use the command line:
 
 ```

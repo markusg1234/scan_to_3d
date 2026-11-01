@@ -8,6 +8,7 @@ from pipeline import (
     Pipeline,
     PipelineError,
     ToolResult,
+    format_duration,
     parse_registered_images,
 )
 
@@ -275,6 +276,12 @@ class ParsingTests(unittest.TestCase):
 
     def test_registered_images_missing(self):
         self.assertEqual(parse_registered_images("nothing useful"), 0)
+
+    def test_durations_read_like_a_clock(self):
+        self.assertEqual(format_duration(0), "0:00")
+        self.assertEqual(format_duration(8.9), "0:08")
+        self.assertEqual(format_duration(228), "3:48")
+        self.assertEqual(format_duration(3725), "1:02:05")
 
 
 if __name__ == "__main__":

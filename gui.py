@@ -3,6 +3,7 @@
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -12,9 +13,11 @@ from pipeline import (
     Cancelled,
     Pipeline,
     PipelineError,
+    format_duration,
     has_gpu_tools,
     load_tools,
 )
+from settings import load_settings, save_settings
 
 POLL_MILLISECONDS = 100
 STATUS_TEXT = {
@@ -25,18 +28,27 @@ STATUS_TEXT = {
 }
 
 
+def existing_folder(path):
+    return path if isinstance(path, str) and os.path.isdir(path) else ""
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Photo to 3D")
-        self.geometry("760x660")
+        self.geometry("820x660")
         self.minsize(620, 520)
         self.events = queue.Queue()
         self.pipeline = None
         self.closing = False
         self.result_folder = None
-        self.photos = tk.StringVar()
-        self.output = tk.StringVar()
+        self.run_started = None
+        self.elapsed = 0
+        self.running_stage = None
+        self.stage_started = None
+        settings = load_settings()
+        self.photos = tk.StringVar(value=existing_folder(settings.get("photos")))
+        self.output = tk.StringVar(value=existing_folder(settings.get("output")))
         self.quality = tk.StringVar(value="normal")
         self.gpu = tk.BooleanVar(value=False)
         self.restart = tk.BooleanVar(value=False)
@@ -88,16 +100,20 @@ class App(tk.Tk):
             buttons, text="Open Result Folder", command=self.open_result, state="disabled"
         )
         self.open_button.pack(side="left")
+        self.time_label = ttk.Label(buttons, text="Time: 0:00")
+        self.time_label.pack(side="right")
 
         self.stage_list = ttk.Treeview(
-            self, columns=("status",), show="tree headings", height=len(STAGE_TITLES)
+            self, columns=("status", "time"), show="tree headings", height=len(STAGE_TITLES)
         )
         self.stage_list.heading("#0", text="Stage")
         self.stage_list.heading("status", text="Status")
+        self.stage_list.heading("time", text="Time")
         self.stage_list.column("status", width=130, stretch=False)
+        self.stage_list.column("time", width=80, stretch=False, anchor="e")
         self.stage_list.pack(fill="x", padx=12, pady=10)
         for stage, title in STAGE_TITLES.items():
-            self.stage_list.insert("", "end", iid=stage, text=title, values=("",))
+            self.stage_list.insert("", "end", iid=stage, text=title, values=("", ""))
 
         log_frame = ttk.Frame(self, padding=(12, 0, 12, 12))
         log_frame.pack(fill="both", expand=True)
@@ -115,20 +131,30 @@ class App(tk.Tk):
             return False
 
     def _browse(self, variable, title):
-        folder = filedialog.askdirectory(title=title)
+        start_in = variable.get() or self.photos.get() or self.output.get()
+        folder = filedialog.askdirectory(title=title, initialdir=start_in or None)
         if folder:
             variable.set(os.path.normpath(folder))
+            self._save_folders()
+
+    def _save_folders(self):
+        save_settings({"photos": self.photos.get(), "output": self.output.get()})
 
     def start(self):
         if not self.photos.get() or not self.output.get():
             messagebox.showinfo("Photo to 3D", "Choose a photo folder and an output folder first.")
             return
+        self._save_folders()
         for stage in STAGE_TITLES:
             self.stage_list.set(stage, "status", "")
+            self.stage_list.set(stage, "time", "")
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
         self.result_folder = None
+        self.running_stage = None
+        self.run_started = time.monotonic()
+        self.elapsed = 0
         self.pipeline = Pipeline(
             self.photos.get(),
             self.output.get(),
@@ -179,7 +205,17 @@ class App(tk.Tk):
         if self.closing and not self.pipeline:
             self.destroy()
             return
+        self._update_times()
         self.after(POLL_MILLISECONDS, self._process_events)
+
+    def _update_times(self):
+        now = time.monotonic()
+        if self.run_started is not None:
+            self.elapsed = now - self.run_started
+            self.time_label.configure(text=f"Time: {format_duration(self.elapsed)}")
+        if self.running_stage:
+            stage_time = format_duration(now - self.stage_started)
+            self.stage_list.set(self.running_stage, "time", stage_time)
 
     def _on_log(self, line):
         at_end = self.log.yview()[1] >= 1.0
@@ -191,8 +227,17 @@ class App(tk.Tk):
 
     def _on_stage(self, stage, status):
         self.stage_list.set(stage, "status", STATUS_TEXT[status])
+        if status == "running":
+            self.running_stage = stage
+            self.stage_started = time.monotonic()
+        elif stage == self.running_stage:
+            self._update_times()
+            self.running_stage = None
 
     def _finish_run(self):
+        self._update_times()
+        self.run_started = None
+        self.running_stage = None
         self.pipeline = None
         self.start_button.state(["!disabled"])
         self.cancel_button.state(["disabled"])
@@ -206,6 +251,7 @@ class App(tk.Tk):
             f"Placed {report['photos_placed']} of {report['photos_found']} photos.",
             f"Dense stage ran on: {report['dense_device']}",
             *report["warnings"],
+            f"Time: {format_duration(self.elapsed)}",
             f"Model: {report['model']}",
         ]
         for line in lines:

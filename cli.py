@@ -2,8 +2,9 @@
 
 import argparse
 import sys
+import time
 
-from pipeline import QUALITIES, STAGE_TITLES, Pipeline, PipelineError
+from pipeline import QUALITIES, STAGE_TITLES, Pipeline, PipelineError, format_duration
 
 
 def print_stage(stage, status):
@@ -29,6 +30,7 @@ def main():
         on_log=print if args.verbose else lambda line: None,
         on_stage=print_stage,
     )
+    started = time.monotonic()
     try:
         report = pipeline.run()
     except PipelineError as error:
@@ -42,6 +44,7 @@ def main():
     print(f"\nPlaced {report['photos_placed']} of {report['photos_found']} photos.")
     for warning in report["warnings"]:
         print(f"Warning: {warning}")
+    print(f"Time: {format_duration(time.monotonic() - started)}")
     print(f"Model: {report['model']}")
     return 0
 
