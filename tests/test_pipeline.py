@@ -8,6 +8,8 @@ from pathlib import Path
 
 from pipeline import (
     NO_PLACEMENT_HELP,
+    STILL_BACKGROUND_HELP,
+    WEAK_PHOTOS_HELP,
     WEAK_VIDEO_HELP,
     Pipeline,
     PipelineError,
@@ -21,6 +23,7 @@ from pipeline import (
     pick_sharpest,
     read_camera_centers,
     select_expression,
+    still_share,
     viewing_angle,
 )
 
@@ -48,6 +51,21 @@ def blur_text(scores):
     return "\n".join(lines) + "\n"
 
 
+def images_bin(photos, still=0, moving=0, pause=0, shift=50):
+    """Build an images.bin whose points stay put or shift, once a pause at the start is over."""
+    data = struct.pack("<Q", photos)
+    for photo in range(photos):
+        data += struct.pack("<I7dI", photo, 1, 0, 0, 0, 0, 0, 0, 1)
+        data += f"photo{photo}.jpg".encode() + b"\0"
+        data += struct.pack("<Q", still + moving + 1)
+        data += struct.pack("<ddq", 7, 7, -1)  # A feature that isn't part of any point.
+        for point in range(still):
+            data += struct.pack("<ddq", 99, 99, point)
+        for point in range(still, still + moving):
+            data += struct.pack("<ddq", 99 + shift * max(photo - pause, 0), 99, point)
+    return data
+
+
 class FakeRunner:
     """Stands in for ToolRunner: records commands and creates the files tools would."""
 
@@ -60,6 +78,7 @@ class FakeRunner:
         analyzer_stats="",
         blur_scores=(5.0, 4.0, 3.0, 2.0, 1.0, 5.0, 4.0, 3.0, 2.0, 1.0),
         lost_frames=0,
+        images=None,
     ):
         self.models = {"0": 5} if models is None else models
         self.fail_stage = fail_stage
@@ -68,6 +87,7 @@ class FakeRunner:
         self.analyzer_stats = analyzer_stats
         self.blur_scores = blur_scores
         self.lost_frames = lost_frames
+        self.images = images
         self.stages = []
         self.commands = {}
         self.calls = []
@@ -86,7 +106,10 @@ class FakeRunner:
             return ToolResult(0, "")
         if stage == "mapping":
             for name in self.models:
-                (self.output_dir / "work" / "sparse" / name).mkdir()
+                model = self.output_dir / "work" / "sparse" / name
+                model.mkdir()
+                if self.images:
+                    (model / "images.bin").write_bytes(self.images)
             return ToolResult(self.mapper_exit, "")
         if stage == "select_model":
             name = command[-1].split("/")[-1]
@@ -364,6 +387,36 @@ class PhotoCheckTests(PipelineTestCase):
         self.assertEqual(photo_problems(castle, 71, 11), [])
         self.assertEqual(len(photo_problems(room, 32, 14)), 4)
 
+    def test_a_still_background_stops_a_run_on_its_own(self):
+        runner = FakeRunner(images=images_bin(10, still=1, moving=9))
+        with self.assertRaises(WeakPhotos) as caught:
+            self.run_pipeline(runner)
+        self.assertIn("10% of the points stay still", str(caught.exception))
+        self.assertIn(STILL_BACKGROUND_HELP, str(caught.exception))
+        self.assertNotIn(WEAK_PHOTOS_HELP, str(caught.exception))
+        self.assertNotIn("undistort", runner.stages)
+        self.assertEqual(self.saved_report()["photo_check"]["still_share"], 0.1)
+
+    def test_a_still_background_can_be_accepted(self):
+        report, _ = self.run_pipeline(
+            FakeRunner(images=images_bin(10, still=1, moving=9)), accept_weak_photos=True
+        )
+        self.assertTrue(report["finished"])
+        self.assertIn("looked weak", report["warnings"][0])
+
+    def test_a_few_still_points_do_not_stop_a_run(self):
+        report, _ = self.run_pipeline(FakeRunner(images=images_bin(10, still=1, moving=39)))
+        self.assertTrue(report["finished"])
+        self.assertEqual(report["photo_check"]["still_share"], 0.025)
+        self.assertEqual(report["photo_check"]["problems"], [])
+
+    def test_weak_signs_with_a_still_background_get_the_background_advice(self):
+        runner = FakeRunner(analyzer_stats=WEAK_STATS, images=images_bin(10, still=1))
+        with self.assertRaises(WeakPhotos) as caught:
+            self.run_pipeline(runner)
+        self.assertIn(STILL_BACKGROUND_HELP, str(caught.exception))
+        self.assertEqual(len(self.saved_report()["photo_check"]["problems"]), 4)
+
 
 class VideoTests(PipelineTestCase):
     def setUp(self):
@@ -543,6 +596,47 @@ class ViewingAngleTests(unittest.TestCase):
         self.write_images([((1, 0, 0, 0), (-5, 0, 0)), ((1, 0, 0, 0), (0, -5, 0))])
         self.write_points([])
         self.assertIsNone(viewing_angle(self.folder))
+
+
+class StillShareTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+
+    def share(self, *args, **kwargs):
+        (self.folder / "images.bin").write_bytes(images_bin(*args, **kwargs))
+        return still_share(self.folder)
+
+    def test_a_moving_point_is_not_still(self):
+        self.assertEqual(self.share(10, moving=5), 0)
+
+    def test_still_points_are_counted_among_all_points(self):
+        self.assertEqual(self.share(10, still=1, moving=3), 0.25)
+
+    def test_too_few_photos_prove_nothing(self):
+        self.assertEqual(self.share(5, still=1), 0)
+        self.assertEqual(self.share(6, still=1), 1)
+
+    def test_the_photos_needed_grow_with_the_set(self):
+        self.assertEqual(self.share(100, moving=4, pause=10), 0)
+        self.assertEqual(self.share(100, moving=4, pause=11), 1)
+
+    def test_a_small_shift_still_counts_as_still(self):
+        self.assertEqual(self.share(6, moving=1, shift=0.2), 1)
+
+    def test_a_steady_drift_does_not_count_as_still(self):
+        self.assertEqual(self.share(6, moving=1, shift=2), 0)
+
+    def test_a_missing_file_gives_no_share(self):
+        self.assertIsNone(still_share(self.folder))
+
+    def test_a_damaged_file_gives_no_share(self):
+        (self.folder / "images.bin").write_bytes(struct.pack("<Q", 3) + b"short")
+        self.assertIsNone(still_share(self.folder))
+
+    def test_a_model_with_no_points_gives_no_share(self):
+        self.assertIsNone(self.share(3))
 
 
 class ParsingTests(unittest.TestCase):

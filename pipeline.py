@@ -12,7 +12,7 @@ import struct
 import subprocess
 import threading
 import time
-from collections import namedtuple
+from collections import Counter, namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +37,15 @@ MAX_REPROJECTION_ERROR = 1.0
 MIN_VIEWING_ANGLE = 45
 WEAK_SIGNS_TO_STOP = 2
 
+# A point is still if enough photos show it within a few pixels of one spot. Good sets
+# had about 0.1% of these at most, and rotating table sets with the background in view had
+# 7% or more. A pause in a video stills every point for a moment, so the count grows with
+# the set.
+STILL_PIXELS = 3
+MIN_STILL_PHOTOS = 6
+STILL_PHOTOS_DIVISOR = 8
+MAX_STILL_SHARE = 0.03
+
 NO_PLACEMENT_HELP = (
     "COLMAP could not work out where the photos were taken from. The usual causes "
     "are too little overlap between photos, or plain or shiny surfaces."
@@ -47,6 +56,10 @@ WEAK_PHOTOS_HELP = (
 )
 WEAK_VIDEO_HELP = (
     "Film a slow, full circle around one matte, textured object, keeping it in view."
+)
+STILL_BACKGROUND_HELP = (
+    "Part of the picture stayed still between photos, so COLMAP can't tell how the camera "
+    "moved. On a rotating table, hide everything that doesn't turn behind a plain backdrop."
 )
 
 
@@ -326,6 +339,38 @@ def read_point_positions(path):
     return points
 
 
+def read_point_tracks(path):
+    """Read how many photos COLMAP placed and where each point appears in them."""
+    tracks = {}
+    with path.open("rb") as file:
+        count = struct.unpack("<Q", file.read(8))[0]
+        for _ in range(count):
+            file.seek(64, 1)
+            while file.read(1) not in (b"\0", b""):  # Skip the image name.
+                pass
+            observations = struct.unpack("<Q", file.read(8))[0]
+            for x, y, point in struct.iter_unpack("<ddq", file.read(observations * 24)):
+                if point != -1:
+                    tracks.setdefault(point, []).append((x, y))
+    return count, tracks
+
+
+def still_share(sparse_dir):
+    """Return the share of points stuck to one spot in the photos, or None if unknown."""
+    try:
+        photos, tracks = read_point_tracks(sparse_dir / "images.bin")
+    except (OSError, struct.error):
+        return None
+    if not tracks:
+        return None
+    needed = max(MIN_STILL_PHOTOS, photos // STILL_PHOTOS_DIVISOR)
+    still = 0
+    for track in tracks.values():
+        spots = Counter((round(x / STILL_PIXELS), round(y / STILL_PIXELS)) for x, y in track)
+        still += max(spots.values()) >= needed
+    return still / len(tracks)
+
+
 def viewing_angle(sparse_dir):
     """Return the widest angle between two cameras around the scene, or None if unknown."""
     try:
@@ -348,7 +393,7 @@ def viewing_angle(sparse_dir):
     return widest
 
 
-def photo_problems(stats, angle, placed):
+def photo_problems(stats, angle, placed, still=None):
     """Return a sentence for each sign of a weak photo set, skipping unknown numbers."""
     problems = []
     if "points" in stats and placed:
@@ -372,6 +417,11 @@ def photo_problems(stats, angle, placed):
         problems.append(
             f"The photos only cover {angle:.0f} degrees around the subject (aim for "
             f"{MIN_VIEWING_ANGLE} or more)."
+        )
+    if still is not None and still > MAX_STILL_SHARE:
+        problems.append(
+            f"{still:.0%} of the points stay still in the picture (aim for "
+            f"{MAX_STILL_SHARE:.0%} or less)."
         )
     return problems
 
@@ -677,16 +727,27 @@ class Pipeline:
 
     def _check_photos(self, model, analyzer_output, placed):
         stats = parse_model_stats(analyzer_output)
-        angle = viewing_angle(self.work_dir / "sparse" / model)
-        problems = photo_problems(stats, angle, placed)
-        self.report["photo_check"] = {**stats, "widest_angle": angle, "problems": problems}
-        if len(problems) < WEAK_SIGNS_TO_STOP:
+        sparse = self.work_dir / "sparse" / model
+        angle = viewing_angle(sparse)
+        still = still_share(sparse)
+        problems = photo_problems(stats, angle, placed, still)
+        self.report["photo_check"] = {
+            **stats,
+            "widest_angle": angle,
+            "still_share": still,
+            "problems": problems,
+        }
+        # This sign is enough alone: a set can pass the others with half its cameras wrong.
+        background_stayed = still is not None and still > MAX_STILL_SHARE
+        if len(problems) < WEAK_SIGNS_TO_STOP and not background_stayed:
             return
         subject, advice = (
             ("These video frames", WEAK_VIDEO_HELP)
             if self.is_video
             else ("These photos", WEAK_PHOTOS_HELP)
         )
+        if background_stayed:
+            advice = STILL_BACKGROUND_HELP
         if not self.accept_weak_photos:
             reasons = "\n".join(f"- {problem}" for problem in problems)
             raise WeakPhotos(f"{subject} look too weak for a good model:\n{reasons}\n{advice}")

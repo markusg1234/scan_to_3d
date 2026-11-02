@@ -56,7 +56,7 @@ The result depends more on the photos than on any setting.
 1. Take 40 to 80 photos of an object, or more if it is large or detailed.
 2. Walk a full circle around it, taking a photo every 10 to 15 degrees, so each photo overlaps the next by about two thirds.
 3. Walk another circle from higher up, so the top is covered too.
-4. Move the camera, not the object, and keep the lighting steady.
+4. Move the camera, not the object, and keep the lighting steady. To turn the object instead, see [Using a rotating table](#using-a-rotating-table).
 5. Keep every photo sharp. Delete blurry ones.
 
 Matte, textured objects work best. Shiny, transparent or plain surfaces reconstruct badly in any photogrammetry software.
@@ -81,9 +81,33 @@ Video input has been tried on one real phone video so far. Photos should still g
 4. Turn stabilization off if you can.
 5. Use bright, steady light, so frames stay sharp while the camera moves.
 
+## Using a rotating table
+
+You can also keep the camera still and turn the object, with photos or a video. COLMAP works out how the camera moved from what changes between pictures, so anything in view that doesn't turn with the object can convince it the camera never moved.
+
+1. Hide everything that doesn't turn. A plain sheet of paper or cloth should fill the whole picture around the table, because even a thin strip of busy wall at the top of the frame can spoil the result.
+2. Put the camera on a tripod.
+3. Put something patterned on the table, such as newspaper, so there's more to match. The table ends up in the model, so trim it off in Blender afterwards.
+4. Turn the table 10 to 15 degrees between photos, or film one slow, full turn.
+5. Raise the camera, tilt it down and do a second turn, so the top is covered.
+6. Use soft, even light. Shadows stay where they are while the object turns, so hard light leaves dark patches in the texture.
+7. Don't let the object shift on the table.
+
+This has only been tried on scenes rendered in Blender, not on a real table. Each scene had 72 frames in two turns:
+
+| Setup | Frames in the right place | Surface within 0.4% of the table's width |
+|---|---|---|
+| Plain backdrop, patterned table, soft light | All | 96% |
+| The same, as a video | All | 92% |
+| The same, with one hard light | All | 97%, with dark patches in the texture |
+| The same, with a plain table | All | 74%, with much of the table missing |
+| Thin strip of busy wall at the top of the low turn | About half | 65%, and stopped by the photo check |
+| Busy wall behind a plain table | None | Unusable, and stopped by the photo check |
+| Busy room all around | None | Unusable, and stopped by the photo check |
+
 ## Photo check
 
-Right after camera solving, the program checks four signs of a weak photo set:
+Right after camera solving, the program checks five signs of a weak photo set:
 
 | Sign | Limit |
 |---|---|
@@ -91,8 +115,11 @@ Right after camera solving, the program checks four signs of a weak photo set:
 | Photos sharing each point | At least 3.5 |
 | Position error | At most 1 pixel |
 | Viewing angle around the subject | At least 45 degrees |
+| Points that stay still in the picture | At most 3% |
 
-If two or more signs fail, the run stops before the long dense stage and lists the reasons. Video frames get the same check. The window then asks whether to continue anyway. On the command line, add `--accept-weak-photos`. The limits come from only two photo sets so far, so a good set could occasionally be stopped. The numbers are saved as `photo_check` in `run_report.json`.
+If two or more signs fail, the run stops before the long dense stage and lists the reasons. Too many still points stop it on their own, because a set can pass everything else with half its cameras in the wrong place. Video frames get the same check. The window then asks whether to continue anyway. On the command line, add `--accept-weak-photos`. The first four limits come from only two photo sets so far, and the still points limit from the rendered scenes above, so a good set could occasionally be stopped. The numbers are saved as `photo_check` in `run_report.json`.
+
+A video that sits still for more than about an eighth of its length can also fail the still points sign. That's a false alarm, so continue anyway, or trim the pause.
 
 ## Speed
 
@@ -136,6 +163,7 @@ In the window, tick **Use graphics card**. `dense_device` in `run_report.json` s
 | "could not work out where the photos were taken from" | Take more photos with more overlap, and avoid plain or shiny subjects |
 | "These photos look too weak for a good model" | Retake them around one matte, textured object, using the steps in Taking the photos |
 | "These video frames look too weak for a good model" | Film again, using the steps in Using a video |
+| "Part of the picture stayed still between photos" | Hide everything that doesn't turn, using the steps in Using a rotating table. If a video paused for a long time, trim the pause or continue anyway |
 | "Video input needs ffmpeg" | Run `python setup_tools.py` |
 | Only some photos are placed | Add photos that bridge the gaps between the parts that were placed |
 | Colour seams on the model | Keep lighting and exposure the same between photos. See the note below |
