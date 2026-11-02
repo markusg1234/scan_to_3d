@@ -19,8 +19,10 @@ from pipeline import (
     format_duration,
     has_gpu_tools,
     load_tools,
+    view_model,
 )
 from settings import load_settings, save_settings
+from size_window import RealSizeWindow
 
 POLL_MILLISECONDS = 100
 STATUS_TEXT = {
@@ -44,7 +46,6 @@ class App(tk.Tk):
         self.events = queue.Queue()
         self.pipeline = None
         self.closing = False
-        self.result_folder = None
         self.run_started = None
         self.elapsed = 0
         self.running_stage = None
@@ -109,9 +110,13 @@ class App(tk.Tk):
         )
         self.cancel_button.pack(side="left", padx=8)
         self.open_button = ttk.Button(
-            buttons, text="Open Result Folder", command=self.open_result, state="disabled"
+            buttons, text="Open Result Folder", command=self.open_result
         )
         self.open_button.pack(side="left")
+        self.view_button = ttk.Button(buttons, text="View Model", command=self.view)
+        self.view_button.pack(side="left", padx=8)
+        self.size_button = ttk.Button(buttons, text="Set Real Size...", command=self.set_size)
+        self.size_button.pack(side="left")
         self.time_label = ttk.Label(buttons, text="Time: 0:00")
         self.time_label.pack(side="right")
 
@@ -182,7 +187,6 @@ class App(tk.Tk):
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
-        self.result_folder = None
         self.running_stage = None
         self.run_started = time.monotonic()
         self.elapsed = 0
@@ -198,7 +202,8 @@ class App(tk.Tk):
             on_stage=lambda stage, status: self.events.put(("stage", stage, status)),
         )
         self.start_button.state(["disabled"])
-        self.open_button.state(["disabled"])
+        self.view_button.state(["disabled"])
+        self.size_button.state(["disabled"])
         self.cancel_button.state(["!disabled"])
         threading.Thread(target=self._work, args=(self.pipeline,), daemon=True).start()
 
@@ -220,8 +225,34 @@ class App(tk.Tk):
             self.pipeline.cancel()
 
     def open_result(self):
-        if self.result_folder:
-            os.startfile(self.result_folder)
+        output = self.output.get()
+        if not output or not os.path.isdir(output):
+            messagebox.showinfo("Photo to 3D", "Choose an output folder that has a run in it first.")
+            return
+        model = os.path.join(output, "model")
+        os.startfile(model if os.path.isdir(model) else output)
+
+    def view(self):
+        if not self.output.get():
+            messagebox.showinfo("Photo to 3D", "Choose the output folder that holds the model first.")
+            return
+        # In the background, because it waits a few seconds to see whether the viewer crashes.
+        threading.Thread(target=self._view, args=(self.output.get(),), daemon=True).start()
+
+    def set_size(self):
+        if not self.output.get():
+            messagebox.showinfo("Photo to 3D", "Choose the output folder that holds the model first.")
+            return
+        try:
+            RealSizeWindow(self, self.output.get())
+        except PipelineError as error:
+            messagebox.showinfo("Photo to 3D", str(error))
+
+    def _view(self, output):
+        try:
+            view_model(output)
+        except PipelineError as error:
+            self.events.put(("view_failed", str(error)))
 
     def close(self):
         if self.pipeline:
@@ -275,12 +306,12 @@ class App(tk.Tk):
         self.running_stage = None
         self.pipeline = None
         self.start_button.state(["!disabled"])
+        self.view_button.state(["!disabled"])
+        self.size_button.state(["!disabled"])
         self.cancel_button.state(["disabled"])
 
     def _on_finished(self, report):
-        self.result_folder = os.path.dirname(report["model"])
         self._finish_run()
-        self.open_button.state(["!disabled"])
         self.restart.set(False)
         lines = [
             f"Placed {report['photos_placed']} of {report['photos_found']} photos.",
@@ -288,6 +319,7 @@ class App(tk.Tk):
             *report["warnings"],
             f"Time: {format_duration(self.elapsed)}",
             f"Model: {report['model']}",
+            f"STL: {report['stl']}" + (" (in mm)" if "real_size" in report else ""),
         ]
         for line in lines:
             self._on_log(line)
@@ -307,6 +339,10 @@ class App(tk.Tk):
             # Start Over already ran, and the finished stages should be kept.
             self.restart.set(False)
             self.start(accept_weak_photos=True)
+
+    def _on_view_failed(self, message):
+        if not self.closing:
+            messagebox.showinfo("Photo to 3D", message)
 
     def _on_failed(self, message):
         self._finish_run()

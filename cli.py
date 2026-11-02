@@ -12,6 +12,7 @@ from pipeline import (
     PipelineError,
     WeakPhotos,
     format_duration,
+    view_model,
 )
 
 
@@ -37,6 +38,7 @@ def main():
         default=DEFAULT_VIDEO_FRAMES,
         help=f"how many frames to use from a video (default {DEFAULT_VIDEO_FRAMES})",
     )
+    parser.add_argument("--view", action="store_true", help="open the model in a viewer when done")
     parser.add_argument("--verbose", action="store_true", help="show tool output")
     args = parser.parse_args()
 
@@ -70,6 +72,13 @@ def main():
         print(f"Warning: {warning}")
     print(f"Time: {format_duration(time.monotonic() - started)}")
     print(f"Model: {report['model']}")
+    print(f"STL: {report['stl']}" + (" (in mm)" if "real_size" in report else ""))
+    if args.view:
+        try:
+            view_model(args.output, pipeline.tools)
+        except PipelineError as error:
+            print(f"\n{error}", file=sys.stderr)
+            return 1
     return 0
 
 

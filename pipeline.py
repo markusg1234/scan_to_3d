@@ -29,6 +29,25 @@ LOW_PLACEMENT_RATIO = 0.8
 LOG_TAIL_LINES = 20
 POLL_SECONDS = 0.25
 
+# OpenMVS's viewer sometimes crashes in AMD's OpenGL driver while it loads a model. Every
+# crash seen came within 2 seconds of starting, and opening it again worked.
+VIEWER_START_SECONDS = 5
+VIEWER_ATTEMPTS = 3
+
+# COLMAP's numbers for its camera models without lens distortion.
+SIMPLE_PINHOLE = 0
+PINHOLE = 1
+
+# Real size checks. A clicked point should land within a few pixels of where the other photos
+# put it, and the photos need to see it from well apart, or its depth is uncertain.
+MAX_CLICK_ERROR = 3
+MIN_CLICK_ANGLE = 10
+
+# 80 bytes of free text. They must not start with "solid", which marks a text STL.
+STL_HEADER = b"photo_to_3d".ljust(80, b"\0")
+# Each triangle is stored as its normal, its three corners and an unused attribute.
+STL_TRIANGLE = struct.Struct("<12fH")
+
 # Photo check limits. They sit between the good castle sample and one weak set of
 # room photos, so they may need tuning as more photo sets are tried.
 MIN_POINTS_PER_PHOTO = 300
@@ -90,10 +109,11 @@ STAGE_TITLES = {
     "mesh": "Build mesh",
     "refine": "Refine mesh",
     "texture": "Texture and export",
+    "stl": "Save STL",
 }
 
 # Stages whose results depend on the quality and GPU settings.
-SETTINGS_STAGES = ("densify", "mesh", "refine", "texture")
+SETTINGS_STAGES = ("densify", "mesh", "refine", "texture", "stl")
 
 ToolResult = namedtuple("ToolResult", "exit_code output")
 
@@ -223,6 +243,27 @@ def has_gpu_tools(tools):
     return "colmap_gpu" in tools
 
 
+def view_model(output_dir, tools=None):
+    """Open a finished model in OpenMVS's viewer, reopening it if it crashes as it starts."""
+    output_dir = Path(output_dir).resolve()
+    model_dir = output_dir / "model"
+    if not (model_dir / "model.obj").exists():
+        raise PipelineError(f"There's no model in {output_dir} yet.")
+    tools = tools or load_tools()
+    viewer = Path(tools["openmvs"]["bin"]) / "Viewer.exe"
+    for _ in range(VIEWER_ATTEMPTS):
+        # The viewer looks for the texture in its working folder, not beside the model.
+        process = subprocess.Popen([viewer, "-i", "model.obj"], cwd=model_dir)
+        try:
+            if process.wait(VIEWER_START_SECONDS) == 0:
+                return  # Closed already, but not by a crash.
+        except subprocess.TimeoutExpired:
+            return  # Still open, so it started.
+    raise PipelineError(
+        f"The viewer crashed {VIEWER_ATTEMPTS} times while opening the model. Try again."
+    )
+
+
 def find_photos(folder):
     return sorted(
         path
@@ -303,28 +344,54 @@ def parse_model_stats(analyzer_output):
     return stats
 
 
-def read_camera_centers(path):
-    """Read camera positions from COLMAP's images.bin."""
-    centers = []
+def read_poses(path):
+    """Read each photo's camera number and world-to-camera rotation and translation."""
+    poses = {}
     with path.open("rb") as file:
         count = struct.unpack("<Q", file.read(8))[0]
         for _ in range(count):
-            _, w, x, y, z, tx, ty, tz, _ = struct.unpack("<I7dI", file.read(64))
-            while file.read(1) not in (b"\0", b""):  # Skip the image name.
-                pass
+            _, w, x, y, z, *translation, camera = struct.unpack("<I7dI", file.read(64))
+            name = bytearray()
+            while (byte := file.read(1)) not in (b"\0", b""):
+                name += byte
             observations = struct.unpack("<Q", file.read(8))[0]
             file.seek(observations * 24, 1)
-            # The file stores the world-to-camera pose, so the center is -R^T * t.
             rotation = (
                 (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
                 (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
                 (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
             )
-            centers.append(tuple(
-                -(rotation[0][i] * tx + rotation[1][i] * ty + rotation[2][i] * tz)
-                for i in range(3)
-            ))
-    return centers
+            poses[name.decode()] = (camera, rotation, translation)
+    return poses
+
+
+def camera_center(rotation, translation):
+    """The files store the world-to-camera pose, so the center is -R^T * t."""
+    return tuple(-sum(rotation[row][i] * translation[row] for row in range(3)) for i in range(3))
+
+
+def read_camera_centers(path):
+    """Read camera positions from COLMAP's images.bin."""
+    poses = read_poses(path).values()
+    return [camera_center(rotation, translation) for _, rotation, translation in poses]
+
+
+def read_cameras(path):
+    """Read each camera's focal lengths and center from COLMAP's cameras.bin."""
+    cameras = {}
+    with path.open("rb") as file:
+        count = struct.unpack("<Q", file.read(8))[0]
+        for _ in range(count):
+            camera, model, _, _ = struct.unpack("<IiQQ", file.read(24))
+            if model == SIMPLE_PINHOLE:
+                focal, cx, cy = struct.unpack("<3d", file.read(24))
+                cameras[camera] = (focal, focal, cx, cy)
+            elif model == PINHOLE:
+                cameras[camera] = struct.unpack("<4d", file.read(32))
+            else:
+                # Undistorted models only use the two above, so this file is the wrong one.
+                raise PipelineError(f"The camera in {path} has lens distortion left in it.")
+    return cameras
 
 
 def read_point_positions(path):
@@ -426,6 +493,188 @@ def photo_problems(stats, angle, placed, still=None):
     return problems
 
 
+def read_obj_triangles(path):
+    """Read an OBJ model's faces as triangles of corner positions, splitting larger faces."""
+    vertices, triangles = [], []
+    with path.open("rb") as file:
+        for line in file:
+            if line.startswith(b"v "):
+                vertices.append(tuple(map(float, line.split()[1:4])))
+            elif line.startswith(b"f "):
+                # A corner can also carry texture and normal numbers, as in 4/1 or 4/1/2.
+                # Negative numbers count back from the last vertex read, as list indexes do.
+                numbers = [int(part.partition(b"/")[0]) for part in line.split()[1:]]
+                corners = [vertices[number - 1 if number > 0 else number] for number in numbers]
+                for second, third in zip(corners[1:], corners[2:]):
+                    triangles.append((corners[0], second, third))
+    return triangles
+
+
+def facet_normal(a, b, c):
+    """Return a triangle's unit normal by the right-hand rule, or zeros if it has no area."""
+    (ax, ay, az), (bx, by, bz), (cx, cy, cz) = a, b, c
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    normal = (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
+    length = math.hypot(*normal) or 1  # A triangle with no area keeps its zero normal.
+    return [value / length for value in normal]
+
+
+def write_stl(path, triangles, scale=1):
+    """Write triangles as a binary STL, the file type 3D printing software reads."""
+    with path.open("wb") as file:
+        file.write(STL_HEADER + struct.pack("<I", len(triangles)))
+        for a, b, c in triangles:
+            corners = [value * scale for corner in (a, b, c) for value in corner]
+            file.write(STL_TRIANGLE.pack(*facet_normal(a, b, c), *corners, 0))
+
+
+def write_report(path, report):
+    """Save the run report whole, so stopping halfway can't leave half a file."""
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+Measurement = namedtuple("Measurement", "distance worst_error narrowest_angle")
+RealSize = namedtuple("RealSize", "mm_per_unit size_mm")
+
+
+def click_ray(camera, pose, click):
+    """Return where a photo was taken from and the unit direction a pixel in it looks along."""
+    fx, fy, cx, cy = camera
+    _, rotation, translation = pose
+    local = ((click[0] - cx) / fx, (click[1] - cy) / fy, 1)
+    direction = [sum(rotation[row][i] * local[row] for row in range(3)) for i in range(3)]
+    length = math.hypot(*direction)
+    return camera_center(rotation, translation), [value / length for value in direction]
+
+
+def determinant(matrix):
+    (a, b, c), (d, e, f), (g, h, i) = matrix
+    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+
+def triangulate(rays):
+    """Return the point nearest to every ray, or None if the rays are parallel."""
+    matrix = [[0.0] * 3 for _ in range(3)]
+    vector = [0.0] * 3
+    for start, direction in rays:
+        for i in range(3):
+            for j in range(3):
+                weight = (i == j) - direction[i] * direction[j]
+                matrix[i][j] += weight
+                vector[i] += weight * start[j]
+    whole = determinant(matrix)
+    if abs(whole) < 1e-12:
+        return None
+    # Cramer's rule: each coordinate swaps one column of the matrix for the vector.
+    return [
+        determinant([row[:i] + [value] + row[i + 1:] for row, value in zip(matrix, vector)]) / whole
+        for i in range(3)
+    ]
+
+
+def reprojection_error(camera, pose, point, click):
+    """Return how many pixels a 3D point lands from where it was clicked in a photo."""
+    fx, fy, cx, cy = camera
+    _, rotation, translation = pose
+    x, y, z = (sum(rotation[i][j] * point[j] for j in range(3)) + translation[i] for i in range(3))
+    if z <= 0:
+        return math.inf  # Behind the camera.
+    return math.hypot(fx * x / z + cx - click[0], fy * y / z + cy - click[1])
+
+
+def widest_angle(rays):
+    """Return the widest angle in degrees between any two of the rays."""
+    widest = 0.0
+    for (_, first), (_, second) in itertools.combinations(rays, 2):
+        cosine = sum(a * b for a, b in zip(first, second))
+        widest = max(widest, math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
+    return widest
+
+
+def measure_length(dense_dir, clicks):
+    """Find how far apart two points are in the model, from where they were clicked.
+
+    clicks maps photo names to [point 1, point 2], each an (x, y) pixel position or None.
+    COLMAP puts the center of a photo's top-left pixel at (0.5, 0.5).
+    """
+    try:
+        cameras = read_cameras(dense_dir / "sparse" / "cameras.bin")
+        poses = read_poses(dense_dir / "sparse" / "images.bin")
+    except (OSError, struct.error):
+        raise PipelineError(
+            f"Setting the real size needs the working files in {dense_dir.parent}, and they're "
+            "missing. Run the photos again to make them."
+        ) from None
+    points, errors, angles = [], [], []
+    for number in (0, 1):
+        views = [
+            (cameras[poses[name][0]], poses[name], points_clicked[number])
+            for name, points_clicked in clicks.items()
+            if points_clicked[number] is not None
+        ]
+        if len(views) < 2:
+            raise PipelineError(
+                f"Point {number + 1} has been clicked in {len(views)} "
+                f"photo{'' if len(views) == 1 else 's'}, and it needs at least 2."
+            )
+        rays = [click_ray(camera, pose, click) for camera, pose, click in views]
+        point = triangulate(rays)
+        if point is None:
+            raise PipelineError(f"Every photo sees point {number + 1} from the same direction.")
+        points.append(point)
+        angles.append(widest_angle(rays))
+        errors += [reprojection_error(camera, pose, point, click) for camera, pose, click in views]
+    distance = math.dist(*points)
+    if distance == 0:
+        raise PipelineError("Points 1 and 2 are the same spot.")
+    return Measurement(distance, max(errors), min(angles))
+
+
+def length_problems(measurement):
+    """Return a sentence for each sign that the clicks may give the wrong size."""
+    problems = []
+    if measurement.worst_error > MAX_CLICK_ERROR:
+        problems.append(
+            f"A click is {measurement.worst_error:.1f} pixels from where the other photos put "
+            f"that point (aim for {MAX_CLICK_ERROR} or less). Check the same spots were clicked."
+        )
+    if measurement.narrowest_angle < MIN_CLICK_ANGLE:
+        problems.append(
+            f"The photos see a point from only {measurement.narrowest_angle:.0f} degrees apart "
+            f"(aim for {MIN_CLICK_ANGLE} or more). Use photos taken further around."
+        )
+    return problems
+
+
+def set_real_size(output_dir, clicks, length_mm):
+    """Save model.stl in millimetres, from a known length clicked in the photos."""
+    output_dir = Path(output_dir).resolve()
+    model_dir = output_dir / "model"
+    report_path = output_dir / REPORT_NAME
+    if not report_path.exists() or not (model_dir / "model.obj").exists():
+        raise PipelineError(f"There's no model in {output_dir} yet.")
+    if length_mm <= 0:
+        raise PipelineError("The length must be more than 0 mm.")
+    measurement = measure_length(output_dir / "work" / "dense", clicks)
+    mm_per_unit = length_mm / measurement.distance
+    triangles = read_obj_triangles(model_dir / "model.obj")
+    write_stl(model_dir / "model.stl", triangles, mm_per_unit)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["real_size"] = {
+        "length_mm": length_mm,
+        "mm_per_unit": mm_per_unit,
+        "worst_click_error": round(measurement.worst_error, 2),
+        "narrowest_angle": round(measurement.narrowest_angle, 1),
+        "clicks": clicks,
+    }
+    write_report(report_path, report)
+    corners = [corner for triangle in triangles for corner in triangle]
+    return RealSize(mm_per_unit, [(max(axis) - min(axis)) * mm_per_unit for axis in zip(*corners)])
+
+
 class Pipeline:
     def __init__(
         self,
@@ -507,6 +756,7 @@ class Pipeline:
 
         self.report["finished"] = True
         self.report["model"] = str(self.model_dir / "model.obj")
+        self.report["stl"] = str(self.model_dir / "model.stl")
         self._save_report()
         return self.report
 
@@ -579,9 +829,7 @@ class Pipeline:
         return report
 
     def _save_report(self):
-        temporary = self.report_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self.report, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(self.report_path)
+        write_report(self.report_path, self.report)
 
     def _warn(self, message):
         if message not in self.report["warnings"]:
@@ -854,3 +1102,13 @@ class Pipeline:
         model = self.model_dir / "model.obj"
         if not model.exists() or model.stat().st_size == 0:
             raise PipelineError(f"OpenMVS finished, but {model} is missing or empty.")
+
+    def _stage_stl(self):
+        model = self.model_dir / "model.obj"
+        triangles = read_obj_triangles(model)
+        if not triangles:
+            raise PipelineError(f"{model} has no surface to save as STL.")
+        # A real size set earlier still holds, because it depends only on the camera solve.
+        scale = self.report.get("real_size", {}).get("mm_per_unit", 1)
+        write_stl(self.model_dir / "model.stl", triangles, scale)
+        self.on_log(f"Saved {len(triangles):,} triangles to model.stl.")

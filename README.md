@@ -1,6 +1,6 @@
 # Photo to 3D
 
-Turns overlapping photos taken from different angles, or a video that circles an object, into a textured 3D model. It works out where each photo was taken with [COLMAP](https://colmap.github.io/), then builds the surface and texture with [OpenMVS](https://github.com/cdcseacave/openMVS).
+Turns overlapping photos taken from different angles, or a video that circles an object, into a textured 3D model. It works out where each photo was taken with [COLMAP](https://colmap.github.io/), then builds the surface and texture with [OpenMVS](https://github.com/cdcseacave/openMVS). It also saves the shape as an STL file for 3D printing.
 
 ## Setup
 
@@ -43,11 +43,67 @@ The output folder must not be inside the photo folder.
 
 | Path | Contents |
 |---|---|
-| `model/` | `model.obj`, `model.mtl` and the texture image. Keep these three together |
+| `model/` | `model.obj`, `model.mtl` and the texture image, which must stay together, and `model.stl` for 3D printing |
 | `run_report.json` | Photos found and placed, seconds per stage, settings and tool versions |
-| `work/` | Working files and logs. Safe to delete when you are finished, but a rerun then starts over |
+| `work/` | Working files and logs. Safe to delete when you are finished, but a rerun then starts over, and Set Real Size needs them |
+
+## Viewing the model
+
+Click **View Model** in the window to open the model in the output folder, including one from an earlier run. On the command line, add `--view` to open the model when the run finishes. Either way, it opens in OpenMVS's viewer, which comes with the other tools.
+
+| Control | Action |
+|---|---|
+| Left drag | Turn |
+| Right drag | Move |
+| Scroll wheel | Zoom |
+| Double-click | Centre the view on that point |
+| T | Texture off or on, to see the bare shape |
+| W | Wireframe |
+| R | Reset the view |
+| F1 | All the controls |
+
+To make the viewer's text bigger, move the mouse to the top of the viewer to show its menu bar, then choose View > Render Settings (or press Shift+R) and raise Font Scale. The viewer remembers it. On a 4K screen at 175% scaling, a Font Scale of 2 roughly matches other programs' text.
+
+On the RX 7800 XT used for testing, the viewer crashed in about 1 of every 11 openings, always within 2 seconds while loading the model. View Model and `--view` reopen it when that happens. It also crashed once after T was pressed, so if it closes by itself later on, open it again.
 
 To view a model in Blender, use File > Import > Wavefront (.obj), then switch the viewport to Material Preview.
+
+## 3D printing
+
+`model/model.stl` is the same shape as `model.obj` without the colours, for slicers and FreeCAD. It isn't ready to print as it comes, so first, in a program such as Blender:
+
+1. Trim off the table or room, which comes out joined to the object.
+2. Close the open edges, so the surface becomes a solid. No photo sees the underside of an object standing on a table, so that part is missing.
+3. Turn it upright, because camera solving doesn't know which way is up.
+
+Before that, set the real size as described below. Models have no real-world scale, and slicers read STL numbers as millimetres, so without it the models so far came in only 3 to 10 mm across.
+
+Blender labels the numbers in an STL as metres, so a 150 mm object shows as 150 m. Leave its size alone: Blender's STL export keeps the numbers, so the slicer still reads millimetres.
+
+## Real size
+
+The photos can't tell a small object close up from a big one far away, so the program needs one real length. Click both ends of it in two or more photos, and it saves `model.stl` in millimetres.
+
+1. Put something of known length in the shot, such as a steel ruler lying flat beside the object, or pick two sharp points on the object and measure between them with calipers. Use the longest length you can, between points marked on the surface, such as ruler ends, screw heads or pen marks. Don't use the edge of something round, because from another angle the edge is a different spot. On a rotating table, put the ruler on the turning part, because anything that stays still confuses camera solving.
+2. After the run, click **Set Real Size...** in the window.
+3. Choose a photo in the list. Click near one end in the photo, then exactly on it in the zoomed view on the right. Do the same for the other end. The bold line under the photos says what to click next, how many photos each point is in, and how far apart those photos were taken.
+4. Repeat in two more photos, each at least 30 degrees further around. Video frames next to each other in the list were taken from almost the same spot, so pick frames far apart, such as the first, middle and last. Two photos are enough to measure, but with only two, a click on slightly the wrong spot can go unnoticed. A third lets the program catch it.
+5. Type the length in millimetres and click **Save**.
+
+The program then rewrites `model.stl` in millimetres and keeps the size when you rerun at another quality. `model.obj` stays in its own units. It warns if a click lands more than 3 pixels from where the other photos put that point, or if the photos see a point from less than 10 degrees apart.
+
+This was tested on a rendered scene with a 300 mm ruler, whose true size was known:
+
+| Clicks | Size error, for 95% of tries |
+|---|---|
+| Exactly on the marks | 0.01% |
+| About half a pixel out on average, photos 30 to 180 degrees apart | 0.2 to 0.3% |
+| About a pixel out on average, photos 30 to 180 degrees apart | 0.4 to 0.6% |
+| About a pixel out on average, photos 10 degrees apart | 0.9% |
+| One click 10 pixels out, two photos | Up to 1.7%, and not always warned about |
+| One click 10 pixels out, three photos | Up to 0.9%, always warned about |
+
+A real ruler's ends are harder to pin down than the rendered marks, so expect somewhat larger errors. On a 100 mm object, 0.5% is half a millimetre.
 
 ## Taking the photos
 
@@ -170,7 +226,7 @@ In the window, tick **Use graphics card**. `dense_device` in `run_report.json` s
 | Details are missing | Use High, try GPU mode, and add close-up photos of those parts |
 | "The graphics card ran out of memory" | Use a lower quality, or close other programs that use the card |
 | The table or room is in the model | Trim it in Blender. Background removal is not included |
-| The model is the wrong size | Models have no real-world scale. Scale it in Blender before 3D printing |
+| The model is the wrong size | Models have no real-world scale. Use Set Real Size, as in Real size |
 
 Each stage writes a log to `work/logs/`.
 

@@ -2,9 +2,11 @@ import json
 import math
 import re
 import struct
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from pipeline import (
     NO_PLACEMENT_HELP,
@@ -15,16 +17,24 @@ from pipeline import (
     PipelineError,
     ToolResult,
     WeakPhotos,
+    facet_normal,
     format_duration,
+    length_problems,
+    measure_length,
     parse_blur_scores,
     parse_model_stats,
     parse_registered_images,
     photo_problems,
     pick_sharpest,
     read_camera_centers,
+    read_cameras,
+    read_obj_triangles,
     select_expression,
+    set_real_size,
     still_share,
+    view_model,
     viewing_angle,
+    write_stl,
 )
 
 TOOLS = {
@@ -40,6 +50,58 @@ ALL_BEFORE_DENSIFY = ["features", "matching", "mapping", "select_model", "undist
 DENSIFY_ONWARD = ["densify", "mesh", "texture"]
 WEAK_STATS = "Points: 700\nMean track length: 3.04\nMean reprojection error: 1.26"
 ONE_WEAK_SIGN_STATS = "Points: 3600\nMean track length: 3.04\nMean reprojection error: 0.54"
+TRIANGLE_OBJ = "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n"
+SQUARE_OBJ = "v 0 0 0\nv 2 0 0\nv 2 2 0\nv 0 2 0\nf 1 2 3 4\n"
+
+
+CAMERA = (1000.0, 1000.0, 640.0, 360.0)
+CAMERA_DISTANCE = 5
+
+
+def write_dense_model(folder, angles, camera=CAMERA, model=1):
+    """Write undistorted COLMAP files for photos taken from these angles around the y axis,
+    each looking at the origin from CAMERA_DISTANCE away."""
+    sparse = folder / "sparse"
+    sparse.mkdir(parents=True, exist_ok=True)
+    cameras = struct.pack("<QIiQQ", 1, 1, model, 1280, 720)
+    (sparse / "cameras.bin").write_bytes(cameras + struct.pack(f"<{len(camera)}d", *camera))
+    images = struct.pack("<Q", len(angles))
+    for index, angle in enumerate(angles):
+        half = math.radians(angle) / 2
+        images += struct.pack(
+            "<I7dI", index, math.cos(half), 0, math.sin(half), 0, 0, 0, CAMERA_DISTANCE, 1
+        )
+        images += f"photo{index}.jpg".encode() + b"\0" + struct.pack("<Q", 0)
+    (sparse / "images.bin").write_bytes(images)
+
+
+def project(angle, point):
+    """Where a point appears in the photo taken from this angle, in COLMAP's pixel positions."""
+    cosine, sine = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    x, y, z = point
+    x, z = cosine * x + sine * z, -sine * x + cosine * z + CAMERA_DISTANCE
+    fx, fy, cx, cy = CAMERA
+    return [fx * x / z + cx, fy * y / z + cy]
+
+
+POINT_1 = (-1.0, 0.2, 0.0)
+POINT_2 = (1.0, -0.3, 0.5)
+
+
+def clicks_from(angles):
+    return {
+        f"photo{index}.jpg": [project(angle, POINT_1), project(angle, POINT_2)]
+        for index, angle in enumerate(angles)
+    }
+
+
+def read_stl(path):
+    """Read a binary STL's header and each triangle's normal, corners and attribute."""
+    data = path.read_bytes()
+    count = struct.unpack_from("<I", data, 80)[0]
+    if len(data) != 84 + 50 * count:
+        raise AssertionError(f"{len(data)} bytes don't hold {count} triangles")
+    return data[:80], [struct.unpack_from("<12fH", data, 84 + 50 * n) for n in range(count)]
 
 
 def blur_text(scores):
@@ -79,6 +141,7 @@ class FakeRunner:
         blur_scores=(5.0, 4.0, 3.0, 2.0, 1.0, 5.0, 4.0, 3.0, 2.0, 1.0),
         lost_frames=0,
         images=None,
+        obj=TRIANGLE_OBJ,
     ):
         self.models = {"0": 5} if models is None else models
         self.fail_stage = fail_stage
@@ -88,6 +151,7 @@ class FakeRunner:
         self.blur_scores = blur_scores
         self.lost_frames = lost_frames
         self.images = images
+        self.obj = obj
         self.stages = []
         self.commands = {}
         self.calls = []
@@ -115,7 +179,7 @@ class FakeRunner:
             name = command[-1].split("/")[-1]
             return ToolResult(0, f"Registered images: {self.models[name]}\n{self.analyzer_stats}")
         if stage == "texture":
-            (self.output_dir / "model" / "model.obj").write_text("v 0 0 0\n")
+            (self.output_dir / "model" / "model.obj").write_text(self.obj)
         return ToolResult(0, "")
 
     def _write_video_files(self, command):
@@ -285,6 +349,260 @@ class FolderTests(PipelineTestCase):
 
         with self.assertRaisesRegex(PipelineError, "missing or empty"):
             self.run_pipeline(NoModelRunner())
+
+
+class StlTests(PipelineTestCase):
+    def test_a_finished_run_saves_an_stl_beside_the_obj(self):
+        report, _ = self.run_pipeline()
+        stl = self.output.resolve() / "model" / "model.stl"
+        header, triangles = read_stl(stl)
+        self.assertFalse(header.startswith(b"solid"))
+        self.assertEqual(triangles, [(0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0)])
+        self.assertEqual(report["stl"], str(stl))
+        self.assertIn("stl", self.saved_report()["stages"])
+
+    def test_a_run_finished_before_stl_output_only_saves_the_stl(self):
+        self.run_pipeline()
+        stl = self.output / "model" / "model.stl"
+        stl.unlink()
+        report = self.saved_report()
+        del report["stages"]["stl"], report["stl"]
+        (self.output / "run_report.json").write_text(json.dumps(report), encoding="utf-8")
+        _, runner = self.run_pipeline()
+        self.assertEqual(runner.stages, [])
+        self.assertTrue(stl.exists())
+
+    def test_a_quality_change_saves_the_stl_again(self):
+        self.run_pipeline(quality="draft")
+        self.run_pipeline(FakeRunner(obj=SQUARE_OBJ), quality="normal")
+        _, triangles = read_stl(self.output / "model" / "model.stl")
+        self.assertEqual(len(triangles), 2)
+
+    def test_a_model_with_no_surface_is_an_error(self):
+        with self.assertRaisesRegex(PipelineError, "no surface to save as STL"):
+            self.run_pipeline(FakeRunner(obj="v 0 0 0\n"))
+        stages = self.saved_report()["stages"]
+        self.assertIn("texture", stages)
+        self.assertNotIn("stl", stages)
+
+
+def viewer_process(exit_code=None):
+    """Stand in for a viewer that exits with this code as it starts, or stays open if None."""
+    process = mock.Mock()
+    if exit_code is None:
+        process.wait.side_effect = subprocess.TimeoutExpired("Viewer.exe", 5)
+    else:
+        process.wait.return_value = exit_code
+    return process
+
+
+class ViewerTests(PipelineTestCase):
+    CRASH = 0xC0000005
+
+    def view(self, *processes):
+        with mock.patch("pipeline.subprocess.Popen", side_effect=processes) as popen:
+            view_model(self.output, TOOLS)
+        return popen
+
+    def test_the_viewer_runs_in_the_model_folder_so_it_finds_the_texture(self):
+        self.run_pipeline()
+        popen = self.view(viewer_process())
+        popen.assert_called_once_with(
+            [Path("openmvs_bin") / "Viewer.exe", "-i", "model.obj"],
+            cwd=self.output.resolve() / "model",
+        )
+
+    def test_a_viewer_that_crashes_as_it_starts_is_opened_again(self):
+        self.run_pipeline()
+        popen = self.view(viewer_process(self.CRASH), viewer_process())
+        self.assertEqual(popen.call_count, 2)
+
+    def test_a_viewer_closed_straight_away_is_left_closed(self):
+        self.run_pipeline()
+        popen = self.view(viewer_process(0))
+        self.assertEqual(popen.call_count, 1)
+
+    def test_a_viewer_that_keeps_crashing_is_an_error(self):
+        self.run_pipeline()
+        with self.assertRaisesRegex(PipelineError, "crashed 3 times"):
+            self.view(*[viewer_process(self.CRASH) for _ in range(3)])
+
+    def test_a_folder_with_no_model_opens_nothing(self):
+        with mock.patch("pipeline.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(PipelineError, "no model"):
+                view_model(self.output, TOOLS)
+        popen.assert_not_called()
+
+
+class MeasureTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dense = Path(folder.name)
+
+    def test_photos_from_two_angles_give_the_true_distance(self):
+        write_dense_model(self.dense, [0, 90])
+        measurement = measure_length(self.dense, clicks_from([0, 90]))
+        self.assertAlmostEqual(measurement.distance, math.dist(POINT_1, POINT_2))
+        self.assertLess(measurement.worst_error, 1e-6)
+        self.assertEqual(length_problems(measurement), [])
+
+    def test_more_photos_and_a_point_missing_from_one_still_work(self):
+        write_dense_model(self.dense, [0, 40, 80])
+        clicks = clicks_from([0, 40, 80])
+        clicks["photo1.jpg"][1] = None
+        self.assertAlmostEqual(
+            measure_length(self.dense, clicks).distance, math.dist(POINT_1, POINT_2)
+        )
+
+    def test_a_wrong_click_shows_as_a_large_error(self):
+        write_dense_model(self.dense, [0, 45, 90])
+        clicks = clicks_from([0, 45, 90])
+        clicks["photo1.jpg"][0][0] += 20
+        measurement = measure_length(self.dense, clicks)
+        self.assertGreater(measurement.worst_error, 3)
+        self.assertIn("pixels from where", length_problems(measurement)[0])
+
+    def test_photos_from_nearly_the_same_angle_are_flagged(self):
+        write_dense_model(self.dense, [0, 5])
+        measurement = measure_length(self.dense, clicks_from([0, 5]))
+        self.assertLess(measurement.narrowest_angle, 10)
+        self.assertIn("degrees apart", length_problems(measurement)[0])
+
+    def test_each_point_needs_two_photos(self):
+        write_dense_model(self.dense, [0, 90])
+        clicks = clicks_from([0, 90])
+        clicks["photo1.jpg"][1] = None
+        with self.assertRaisesRegex(PipelineError, "Point 2 has been clicked in 1 photo,"):
+            measure_length(self.dense, clicks)
+
+    def test_the_same_spot_for_both_points_is_refused(self):
+        write_dense_model(self.dense, [0, 90])
+        clicks = {name: [points[0], points[0]] for name, points in clicks_from([0, 90]).items()}
+        with self.assertRaisesRegex(PipelineError, "same spot"):
+            measure_length(self.dense, clicks)
+
+    def test_missing_working_files_are_explained(self):
+        with self.assertRaisesRegex(PipelineError, "working files"):
+            measure_length(self.dense, clicks_from([0, 90]))
+
+    def test_a_camera_with_one_focal_length_is_read(self):
+        write_dense_model(self.dense, [0], camera=(1000, 640, 360), model=0)
+        self.assertEqual(read_cameras(self.dense / "sparse" / "cameras.bin"), {1: CAMERA})
+
+    def test_a_camera_with_lens_distortion_is_refused(self):
+        write_dense_model(self.dense, [0], camera=(1000, 640, 360, 0.1), model=2)
+        with self.assertRaisesRegex(PipelineError, "lens distortion"):
+            read_cameras(self.dense / "sparse" / "cameras.bin")
+
+
+class RealSizeTests(PipelineTestCase):
+    def finished_run(self, **options):
+        report, _ = self.run_pipeline(**options)
+        write_dense_model(self.output / "work" / "dense", [0, 90])
+        return report
+
+    def set_ten_mm_per_unit(self):
+        length = 10 * math.dist(POINT_1, POINT_2)
+        return set_real_size(self.output, clicks_from([0, 90]), length)
+
+    def stl_corners(self):
+        _, triangles = read_stl(self.output / "model" / "model.stl")
+        return [round(value, 4) for value in triangles[0][3:12]]
+
+    def test_the_stl_is_saved_in_millimetres(self):
+        self.finished_run()
+        real_size = self.set_ten_mm_per_unit()
+        self.assertAlmostEqual(real_size.mm_per_unit, 10)
+        self.assertEqual([round(value, 6) for value in real_size.size_mm], [20, 20, 0])
+        self.assertEqual(self.stl_corners(), [0, 0, 0, 20, 0, 0, 0, 20, 0])
+        saved = self.saved_report()["real_size"]
+        self.assertAlmostEqual(saved["mm_per_unit"], 10)
+        self.assertEqual(saved["clicks"], clicks_from([0, 90]))
+
+    def test_a_quality_change_keeps_the_real_size(self):
+        self.finished_run(quality="draft")
+        self.set_ten_mm_per_unit()
+        report, _ = self.run_pipeline(quality="normal")
+        self.assertIn("real_size", report)
+        self.assertEqual(self.stl_corners(), [0, 0, 0, 20, 0, 0, 0, 20, 0])
+
+    def test_starting_over_drops_the_real_size(self):
+        self.finished_run()
+        self.set_ten_mm_per_unit()
+        report, _ = self.run_pipeline(restart=True)
+        self.assertNotIn("real_size", report)
+        self.assertEqual(self.stl_corners(), [0, 0, 0, 2, 0, 0, 0, 2, 0])
+
+    def test_a_folder_with_no_model_is_refused(self):
+        with self.assertRaisesRegex(PipelineError, "no model"):
+            set_real_size(self.output, clicks_from([0, 90]), 100)
+
+    def test_a_length_of_zero_is_refused(self):
+        self.finished_run()
+        with self.assertRaisesRegex(PipelineError, "more than 0"):
+            set_real_size(self.output, clicks_from([0, 90]), 0)
+
+
+class StlFileTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+
+    def triangles(self, text):
+        path = self.folder / "model.obj"
+        path.write_bytes(text.encode())
+        return read_obj_triangles(path)
+
+    def test_corners_can_carry_texture_and_normal_numbers(self):
+        vertices = "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+        for face in ("f 1/1 2/2 3/3", "f 1//1 2//1 3//1", "f 1/1/1 2/2/1 3/3/1"):
+            with self.subTest(face=face):
+                self.assertEqual(
+                    self.triangles(vertices + face + "\n"), [((0, 0, 0), (1, 0, 0), (0, 1, 0))]
+                )
+
+    def test_negative_numbers_count_back_from_the_last_vertex(self):
+        text = "v 9 9 9\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf -3 -2 -1\n"
+        self.assertEqual(self.triangles(text), [((0, 0, 0), (1, 0, 0), (0, 1, 0))])
+
+    def test_a_larger_face_is_split_into_triangles(self):
+        self.assertEqual(
+            self.triangles(SQUARE_OBJ),
+            [((0, 0, 0), (2, 0, 0), (2, 2, 0)), ((0, 0, 0), (2, 2, 0), (0, 2, 0))],
+        )
+
+    def test_lines_the_way_openmvs_writes_them(self):
+        text = (
+            "mtllib model.mtl\r\n"
+            "v -0.309924 2.643584 1.488626\r\nv 1 0 0\r\nv 0 1 0\r\n"
+            "vt 0.169863 0.817055\r\nvt 0 0\r\nvt 1 1\r\n"
+            "# A comment\r\n"
+            "usemtl material_00\r\n"
+            "f 1/1 2/2 3/3\r\n"
+        )
+        self.assertEqual(
+            self.triangles(text), [((-0.309924, 2.643584, 1.488626), (1, 0, 0), (0, 1, 0))]
+        )
+
+    def test_the_normal_follows_the_corner_order(self):
+        a, b, c = (0, 0, 0), (2, 0, 0), (0, 2, 0)
+        self.assertEqual(facet_normal(a, b, c), [0, 0, 1])
+        self.assertEqual(facet_normal(a, c, b), [0, 0, -1])
+
+    def test_a_triangle_with_no_area_gets_a_zero_normal(self):
+        self.assertEqual(facet_normal((0, 0, 0), (1, 1, 1), (2, 2, 2)), [0, 0, 0])
+
+    def test_each_triangle_is_written_with_its_normal(self):
+        path = self.folder / "model.stl"
+        write_stl(path, [((0, 0, 0), (2, 0, 0), (0, 2, 0)), ((0, 0, 0), (0, 0, 2), (2, 0, 0))])
+        header, triangles = read_stl(path)
+        self.assertFalse(header.startswith(b"solid"))
+        self.assertEqual(
+            triangles,
+            [(0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0), (0, 1, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0)],
+        )
 
 
 class GpuTests(PipelineTestCase):
