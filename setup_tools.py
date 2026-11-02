@@ -85,7 +85,13 @@ def find_exe(folder, name):
 def check_starts(name, exe):
     """OpenMVS exits with 1 after printing help; a missing DLL gives neither code."""
     with tempfile.TemporaryDirectory() as folder:  # OpenMVS writes a log where it runs.
-        result = subprocess.run([exe, "--help"], cwd=folder, capture_output=True)
+        # OpenMVS writes to the console itself, so only no console at all keeps it quiet.
+        result = subprocess.run(
+            [exe, "--help"],
+            cwd=folder,
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
     if result.returncode not in (0, 1):
         raise SystemExit(f"{name} failed to start (exit code {result.returncode}).")
 
@@ -134,6 +140,7 @@ def main():
         tools[name] = {"version": spec["version"], "bin": str(exe.parent), "exe": str(exe)}
     if args.gpu:
         tools["colmap_gpu"] = register_gpu_build(args.gpu)
+        print(f"GPU mode: registered the COLMAP GPU build at {tools['colmap_gpu']['exe']}")
     TOOLS_JSON.write_text(json.dumps(tools, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {TOOLS_JSON}")
 

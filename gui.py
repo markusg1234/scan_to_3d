@@ -19,6 +19,7 @@ from pipeline import (
     format_duration,
     has_gpu_tools,
     load_tools,
+    stage_title,
     view_model,
 )
 from settings import load_settings, save_settings
@@ -88,7 +89,10 @@ class App(tk.Tk):
             options, textvariable=self.quality, values=list(QUALITIES), state="readonly", width=10
         ).pack(side="left")
         self.gpu_check = ttk.Checkbutton(
-            options, text="Use graphics card (experimental)", variable=self.gpu
+            options,
+            text="Use graphics card (experimental)",
+            variable=self.gpu,
+            command=self._label_dense_stage,
         )
         self.gpu_check.pack(side="left", padx=(14, 0))
         ttk.Checkbutton(options, text="Start over", variable=self.restart).pack(
@@ -129,8 +133,10 @@ class App(tk.Tk):
         self.stage_list.column("status", width=130, stretch=False)
         self.stage_list.column("time", width=80, stretch=False, anchor="e")
         self.stage_list.pack(fill="x", padx=12, pady=10)
-        for stage, title in STAGE_TITLES.items():
-            self.stage_list.insert("", "end", iid=stage, text=title, values=("", ""))
+        for stage in STAGE_TITLES:
+            self.stage_list.insert(
+                "", "end", iid=stage, text=stage_title(stage, self.gpu.get()), values=("", "")
+            )
 
         log_frame = ttk.Frame(self, padding=(12, 0, 12, 12))
         log_frame.pack(fill="both", expand=True)
@@ -139,6 +145,9 @@ class App(tk.Tk):
         self.log.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.log.pack(side="left", fill="both", expand=True)
+
+    def _label_dense_stage(self):
+        self.stage_list.item("densify", text=stage_title("densify", self.gpu.get()))
 
     @staticmethod
     def _gpu_available():
@@ -181,6 +190,7 @@ class App(tk.Tk):
             messagebox.showinfo("Scan to 3D", "Video frames must be a whole number.")
             return
         self._save_folders()
+        self._label_dense_stage()
         for stage in STAGE_TITLES:
             self.stage_list.set(stage, "status", "")
             self.stage_list.set(stage, "time", "")

@@ -7,17 +7,20 @@ import time
 from pipeline import (
     DEFAULT_VIDEO_FRAMES,
     QUALITIES,
-    STAGE_TITLES,
     Pipeline,
     PipelineError,
     WeakPhotos,
     format_duration,
+    stage_title,
     view_model,
 )
 
 
-def print_stage(stage, status):
-    print(f"{STAGE_TITLES[stage]}: {status}", flush=True)
+def stage_printer(gpu):
+    def print_stage(stage, status):
+        print(f"{stage_title(stage, gpu)}: {status}", flush=True)
+
+    return print_stage
 
 
 def main():
@@ -50,8 +53,8 @@ def main():
         restart=args.restart,
         accept_weak_photos=args.accept_weak_photos,
         video_frames=args.frames,
-        on_log=print if args.verbose else lambda line: None,
-        on_stage=print_stage,
+        on_log=(lambda line: print(line, flush=True)) if args.verbose else lambda line: None,
+        on_stage=stage_printer(args.gpu),
     )
     started = time.monotonic()
     try:

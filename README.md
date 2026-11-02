@@ -110,23 +110,11 @@ The program follows each click's line of sight until it meets the model's surfac
 
 ### How accurate it is
 
-Both ways were tested on a rendered scene with a 300 mm ruler and a 50 mm box, whose true sizes were known:
+Tested on a rendered scene with a ruler of known length:
 
-| Clicks | Size error |
-|---|---|
-| Same spots, exactly on the marks | 0.01% |
-| Same spots, about half a pixel out on average, photos 30 to 180 degrees apart | 0.2 to 0.3%, for 95% of tries |
-| Same spots, about a pixel out on average, photos 30 to 180 degrees apart | 0.4 to 0.6%, for 95% of tries |
-| Same spots, about a pixel out on average, photos 10 degrees apart | 0.9%, for 95% of tries |
-| Same spots, one click 10 pixels out, two photos | Up to 1.7%, and not always warned about |
-| Same spots, one click 10 pixels out, three photos | Up to 0.9%, always warned about |
-| Same spots, on the box's corners | 0.00% |
-| Different spots, ruler marks lying flat, in each of 62 photos | 0.13% at worst |
-| Different spots, ruler marks, about a pixel out on average | 0.8%, for 90% of tries |
-| Different spots, the ruler's corners | 1.8% at worst |
-| Different spots, the box's corners | Up to 75% out, but every click that was 1 cm or more out was flagged as on an edge |
-
-A real ruler's ends are harder to pin down than the rendered marks, so expect somewhat larger errors. On a 100 mm object, 0.5% is half a millimetre.
+- With normal clicking, the size came out within about 0.5%, which is half a millimetre on a 100 mm object. A real ruler's ends are harder to pin down, so expect a little more.
+- Use three photos. With only two, a click on the wrong spot can go unnoticed and throw the size off by up to 1.7%.
+- In "Different spots in each photo", keep away from corners and edges. Clicks there were up to 75% out, though the program warned about every one that was badly wrong.
 
 ## Taking the photos
 
@@ -233,7 +221,13 @@ python setup_tools.py --gpu
 python cli.py "C:\path\to\photos" "C:\path\to\output" --quality normal --gpu
 ```
 
-In the window, tick **Use graphics card**. `dense_device` in `run_report.json` shows where the dense stage ran.
+In the window, tick **Use graphics card**. The stage list then shows **Dense point cloud (graphics card)**, and the log says when the card takes over. `dense_device` in `run_report.json` shows where the dense stage ran.
+
+Only that stage uses the card. Finding features, matching, solving cameras, building the mesh, texturing and saving the STL all run on the CPU, so the CPU is busy for most of a run, even in GPU mode.
+
+To watch the card work, use AMD Software: Adrenalin Edition's performance metrics, which read the card directly. During the dense stage they showed the RX 7800 XT at 100%.
+
+Task Manager barely shows this work with AMD's October 2026 drivers. During the same stage it showed about 1%: its Compute 0 graph read between 1 and 16%, and its 3D graph stayed near idle, while the CPU dropped to about 10%. The card is still doing the full job: the castle sample's dense stage took the same time as with the earlier driver, 78, 189 and 278 seconds at Draft, Normal and High. In Task Manager, the clearest sign is Dedicated GPU memory, which rose by about 0.6 GB while the stage ran and fell back when it finished.
 
 ## Troubleshooting
 

@@ -121,6 +121,13 @@ STAGE_TITLES = {
     "stl": "Save STL",
 }
 
+def stage_title(stage, gpu):
+    """Name a stage, saying where the dense stage runs, since it's the only one that can move."""
+    if stage == "densify":
+        return f"{STAGE_TITLES[stage]} ({'graphics card' if gpu else 'CPU'})"
+    return STAGE_TITLES[stage]
+
+
 # Stages whose results depend on the quality and GPU settings.
 SETTINGS_STAGES = ("densify", "mesh", "refine", "texture", "stl")
 
@@ -1222,6 +1229,8 @@ class Pipeline:
 
     def _stage_densify(self):
         if self.gpu:
+            # Every other stage runs on the CPU, so say plainly when the card takes over.
+            self.on_log("Dense point cloud: running on the graphics card with COLMAP's GPU build.")
             self._densify_on_gpu()
         else:
             self._densify_on_cpu()

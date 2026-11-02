@@ -35,6 +35,7 @@ from pipeline import (
     select_expression,
     set_real_size,
     set_real_size_on_surface,
+    stage_title,
     surface_point,
     surface_problems,
     still_share,
@@ -761,6 +762,18 @@ class GpuTests(PipelineTestCase):
         report, runner = self.run_pipeline(tools=GPU_TOOLS)
         self.assertIn("DensifyPointCloud", runner.commands["densify"][0])
         self.assertEqual(report["dense_device"], "CPU")
+
+    def test_gpu_mode_says_the_card_is_taking_over(self):
+        for gpu, says_so in ((True, True), (False, False)):
+            with self.subTest(gpu=gpu):
+                lines = []
+                self.run_pipeline(gpu=gpu, tools=GPU_TOOLS, restart=True, on_log=lines.append)
+                self.assertEqual(any("on the graphics card" in line for line in lines), says_so)
+
+    def test_the_dense_stage_is_named_after_where_it_runs(self):
+        self.assertEqual(stage_title("densify", True), "Dense point cloud (graphics card)")
+        self.assertEqual(stage_title("densify", False), "Dense point cloud (CPU)")
+        self.assertEqual(stage_title("mesh", True), "Build mesh")
 
     def test_switching_to_gpu_reruns_the_dense_stages(self):
         self.run_pipeline(tools=GPU_TOOLS)
