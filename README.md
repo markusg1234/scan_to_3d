@@ -254,3 +254,19 @@ In the window, tick **Use graphics card**. `dense_device` in `run_report.json` s
 Each stage writes a log to `work/logs/`.
 
 **Note on seams:** seam leveling is turned off because in OpenMVS 2.4.0 it painted large black patches onto the texture. Exposure differences between photos can therefore show as seams.
+
+## Tools used
+
+The program is a wrapper around these tools. `python setup_tools.py` downloads them from the addresses below and checks each against a fixed checksum. They aren't included in this repository, and each keeps its own licence.
+
+| Tool | Used for | Version | Download | Licence |
+|---|---|---|---|---|
+| [COLMAP](https://colmap.github.io/) | Working out where each photo was taken, and the dense stage in GPU mode | 4.2.1, Windows build without CUDA | [GitHub releases](https://github.com/colmap/colmap/releases) | BSD 3-clause |
+| [OpenMVS](https://github.com/cdcseacave/openMVS) | The dense point cloud, mesh and texture, and the model viewer | 2.4.0 | [GitHub releases](https://github.com/cdcseacave/openMVS/releases) | AGPL-3.0 |
+| [FFmpeg](https://ffmpeg.org/) | Picking and saving video frames | 9.0.2, essentials build by [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) | [GitHub releases](https://github.com/GyanD/codexffmpeg/releases) | GPL-3.0 |
+
+GPU mode also uses AMD's HIP SDK to compile COLMAP on your PC. See [gpu/README.md](gpu/README.md).
+
+## Thank you
+
+Thank you to the developers of COLMAP, OpenMVS and FFmpeg, whose work does the hard part of every model this program makes. Thank you also to Gyan Doshi for the Windows builds of FFmpeg, and to the OpenMVS project for the Sceaux Castle sample photos used for testing.
