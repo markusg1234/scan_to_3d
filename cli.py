@@ -1,4 +1,4 @@
-"""Command line for photo_to_3d."""
+"""Command line for scan_to_3d."""
 
 import argparse
 import sys

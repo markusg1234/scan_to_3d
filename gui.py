@@ -1,4 +1,4 @@
-"""Desktop window for photo_to_3d."""
+"""Desktop window for scan_to_3d."""
 
 import os
 import queue
@@ -40,7 +40,7 @@ def existing_path(path):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Photo to 3D")
+        self.title("Scan to 3D")
         self.geometry("820x660")
         self.minsize(660, 520)
         self.events = queue.Queue()
@@ -175,10 +175,10 @@ class App(tk.Tk):
 
     def start(self, accept_weak_photos=False):
         if not self.photos.get() or not self.output.get():
-            messagebox.showinfo("Photo to 3D", "Choose photos or a video, and an output folder first.")
+            messagebox.showinfo("Scan to 3D", "Choose photos or a video, and an output folder first.")
             return
         if not self.frames.get().isdecimal():
-            messagebox.showinfo("Photo to 3D", "Video frames must be a whole number.")
+            messagebox.showinfo("Scan to 3D", "Video frames must be a whole number.")
             return
         self._save_folders()
         for stage in STAGE_TITLES:
@@ -227,26 +227,26 @@ class App(tk.Tk):
     def open_result(self):
         output = self.output.get()
         if not output or not os.path.isdir(output):
-            messagebox.showinfo("Photo to 3D", "Choose an output folder that has a run in it first.")
+            messagebox.showinfo("Scan to 3D", "Choose an output folder that has a run in it first.")
             return
         model = os.path.join(output, "model")
         os.startfile(model if os.path.isdir(model) else output)
 
     def view(self):
         if not self.output.get():
-            messagebox.showinfo("Photo to 3D", "Choose the output folder that holds the model first.")
+            messagebox.showinfo("Scan to 3D", "Choose the output folder that holds the model first.")
             return
         # In the background, because it waits a few seconds to see whether the viewer crashes.
         threading.Thread(target=self._view, args=(self.output.get(),), daemon=True).start()
 
     def set_size(self):
         if not self.output.get():
-            messagebox.showinfo("Photo to 3D", "Choose the output folder that holds the model first.")
+            messagebox.showinfo("Scan to 3D", "Choose the output folder that holds the model first.")
             return
         try:
             RealSizeWindow(self, self.output.get())
         except PipelineError as error:
-            messagebox.showinfo("Photo to 3D", str(error))
+            messagebox.showinfo("Scan to 3D", str(error))
 
     def _view(self, output):
         try:
@@ -324,7 +324,7 @@ class App(tk.Tk):
         for line in lines:
             self._on_log(line)
         if not self.closing:
-            messagebox.showinfo("Photo to 3D", "\n".join(lines))
+            messagebox.showinfo("Scan to 3D", "\n".join(lines))
 
     def _on_cancelled(self, message):
         self._finish_run()
@@ -334,7 +334,7 @@ class App(tk.Tk):
         self._finish_run()
         self._on_log(message)
         if not self.closing and messagebox.askyesno(
-            "Photo to 3D", f"{message}\n\nContinue anyway?"
+            "Scan to 3D", f"{message}\n\nContinue anyway?"
         ):
             # Start Over already ran, and the finished stages should be kept.
             self.restart.set(False)
@@ -342,13 +342,13 @@ class App(tk.Tk):
 
     def _on_view_failed(self, message):
         if not self.closing:
-            messagebox.showinfo("Photo to 3D", message)
+            messagebox.showinfo("Scan to 3D", message)
 
     def _on_failed(self, message):
         self._finish_run()
         self._on_log(message)
         if not self.closing:
-            messagebox.showerror("Photo to 3D", message)
+            messagebox.showerror("Scan to 3D", message)
 
 
 if __name__ == "__main__":

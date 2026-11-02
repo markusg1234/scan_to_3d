@@ -1,4 +1,4 @@
-# Photo to 3D
+# Scan to 3D
 
 Turns overlapping photos taken from different angles, or a video that circles an object, into a textured 3D model. It works out where each photo was taken with [COLMAP](https://colmap.github.io/), then builds the surface and texture with [OpenMVS](https://github.com/cdcseacave/openMVS). It also saves the shape as an STL file for 3D printing.
 

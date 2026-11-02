@@ -53,7 +53,7 @@ EDGE_CHECK_PIXELS = 8
 MAX_SURFACE_BEND = 0.03
 
 # 80 bytes of free text. They must not start with "solid", which marks a text STL.
-STL_HEADER = b"photo_to_3d".ljust(80, b"\0")
+STL_HEADER = b"scan_to_3d".ljust(80, b"\0")
 # Each triangle is stored as its normal, its three corners and an unused attribute.
 STL_TRIANGLE = struct.Struct("<12fH")
 
