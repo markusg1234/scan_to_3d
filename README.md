@@ -82,26 +82,49 @@ Blender labels the numbers in an STL as metres, so a 150 mm object shows as 150 
 
 ## Real size
 
-The photos can't tell a small object close up from a big one far away, so the program needs one real length. Click both ends of it in two or more photos, and it saves `model.stl` in millimetres.
+The photos can't tell a small object close up from a big one far away, so the program needs at least one real length. After the run, click **Set Real Size...** in the window, and choose one of two ways to give it. Either way, the program rewrites `model.stl` in millimetres and keeps the size when you rerun at another quality. `model.obj` stays in its own units.
 
-1. Put something of known length in the shot, such as a steel ruler lying flat beside the object, or pick two sharp points on the object and measure between them with calipers. Use the longest length you can, between points marked on the surface, such as ruler ends, screw heads or pen marks. Don't use the edge of something round, because from another angle the edge is a different spot. On a rotating table, put the ruler on the turning part, because anything that stays still confuses camera solving.
-2. After the run, click **Set Real Size...** in the window.
-3. Choose a photo in the list. Click near one end in the photo, then exactly on it in the zoomed view on the right. Do the same for the other end. The bold line under the photos says what to click next, how many photos each point is in, and how far apart those photos were taken.
-4. Repeat in two more photos, each at least 30 degrees further around. Video frames next to each other in the list were taken from almost the same spot, so pick frames far apart, such as the first, middle and last. Two photos are enough to measure, but with only two, a click on slightly the wrong spot can go unnoticed. A third lets the program catch it.
-5. Type the length in millimetres and click **Save**.
+| Way | You click | Use it for |
+|---|---|---|
+| The same spots in several photos | The same two spots in 2 or 3 photos | A ruler or marked spots. The most accurate, and it works on corners |
+| Different spots in each photo | Any two spots in each photo, with the length between them | Unmarked objects, on flat areas only |
 
-The program then rewrites `model.stl` in millimetres and keeps the size when you rerun at another quality. `model.obj` stays in its own units. It warns if a click lands more than 3 pixels from where the other photos put that point, or if the photos see a point from less than 10 degrees apart.
+In both, choose a photo in the list, click near a spot in the photo, then exactly on it in the zoomed view on the right. The bold line under the photos says what to click next.
 
-This was tested on a rendered scene with a 300 mm ruler, whose true size was known:
+### The same spots in several photos
 
-| Clicks | Size error, for 95% of tries |
+1. Put something of known length in the shot, such as a steel ruler lying flat beside the object, or pick two spots marked on the object and measure between them with calipers. Use the longest length you can, between points marked on the surface, such as ruler ends, screw heads or pen marks. Don't use the edge of something round, because from another angle the edge is a different spot. On a rotating table, put the ruler on the turning part, because anything that stays still confuses camera solving.
+2. Click point 1 and point 2 in one photo, always on the same two spots.
+3. Repeat in two more photos, each at least 30 degrees further around. Video frames next to each other in the list were taken from almost the same spot, so pick frames far apart, such as the first, middle and last. Two photos are enough to measure, but with only two, a click on slightly the wrong spot can go unnoticed. A third lets the program catch it.
+4. Type the length in millimetres and click **Save**.
+
+The program works out where each spot is in 3D from where the photos were taken, so it doesn't depend on the model's surface. It warns if a click lands more than 3 pixels from where the other photos put that point, or if the photos see a point from less than 10 degrees apart.
+
+### Different spots in each photo
+
+1. In a photo, click two spots whose distance you know or can measure, such as across a flat face of the object, or along a ruler or tape measure lying on the table.
+2. Type that length under the photo, then do the same in another photo. Each photo can use different spots and a different length.
+3. Click **Save**.
+
+The program follows each click's line of sight until it meets the model's surface, so no spot has to be found again in another photo. That only works where the surface is right, so click flat areas. On a corner or edge, the line of sight can slip past the model's slightly rounded edge onto whatever is behind it. The program checks the surface either side of every click and names any click that sits on an edge. It also compares the photos with each other, and warns if they disagree by more than 3% or if only one photo was measured.
+
+### How accurate it is
+
+Both ways were tested on a rendered scene with a 300 mm ruler and a 50 mm box, whose true sizes were known:
+
+| Clicks | Size error |
 |---|---|
-| Exactly on the marks | 0.01% |
-| About half a pixel out on average, photos 30 to 180 degrees apart | 0.2 to 0.3% |
-| About a pixel out on average, photos 30 to 180 degrees apart | 0.4 to 0.6% |
-| About a pixel out on average, photos 10 degrees apart | 0.9% |
-| One click 10 pixels out, two photos | Up to 1.7%, and not always warned about |
-| One click 10 pixels out, three photos | Up to 0.9%, always warned about |
+| Same spots, exactly on the marks | 0.01% |
+| Same spots, about half a pixel out on average, photos 30 to 180 degrees apart | 0.2 to 0.3%, for 95% of tries |
+| Same spots, about a pixel out on average, photos 30 to 180 degrees apart | 0.4 to 0.6%, for 95% of tries |
+| Same spots, about a pixel out on average, photos 10 degrees apart | 0.9%, for 95% of tries |
+| Same spots, one click 10 pixels out, two photos | Up to 1.7%, and not always warned about |
+| Same spots, one click 10 pixels out, three photos | Up to 0.9%, always warned about |
+| Same spots, on the box's corners | 0.00% |
+| Different spots, ruler marks lying flat, in each of 62 photos | 0.13% at worst |
+| Different spots, ruler marks, about a pixel out on average | 0.8%, for 90% of tries |
+| Different spots, the ruler's corners | 1.8% at worst |
+| Different spots, the box's corners | Up to 75% out, but every click that was 1 cm or more out was flagged as on an edge |
 
 A real ruler's ends are harder to pin down than the rendered marks, so expect somewhat larger errors. On a 100 mm object, 0.5% is half a millimetre.
 

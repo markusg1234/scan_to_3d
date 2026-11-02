@@ -42,6 +42,15 @@ PINHOLE = 1
 # put it, and the photos need to see it from well apart, or its depth is uncertain.
 MAX_CLICK_ERROR = 3
 MIN_CLICK_ANGLE = 10
+# Photos measured on the surface should agree. Flat spots agreed within about 2% in testing,
+# while corners of a small box, where the surface was rough, were up to 75% out.
+MAX_SURFACE_SPREAD = 0.03
+# A spot on an edge or corner can slip past the model's slightly rounded edge onto what's
+# behind it, which put clicks on a box's corners 6 to 15 cm out. The surface either side of a
+# click shows it: flat spots on a ruler bent at most 1.2% over 8 pixels, and every click that
+# slipped bent 7% or more.
+EDGE_CHECK_PIXELS = 8
+MAX_SURFACE_BEND = 0.03
 
 # 80 bytes of free text. They must not start with "solid", which marks a text STL.
 STL_HEADER = b"photo_to_3d".ljust(80, b"\0")
@@ -493,21 +502,29 @@ def photo_problems(stats, angle, placed, still=None):
     return problems
 
 
-def read_obj_triangles(path):
-    """Read an OBJ model's faces as triangles of corner positions, splitting larger faces."""
-    vertices, triangles = [], []
+def read_obj(path):
+    """Read an OBJ model's corner positions, and its faces as triangles of corner numbers."""
+    vertices, faces = [], []
     with path.open("rb") as file:
         for line in file:
             if line.startswith(b"v "):
                 vertices.append(tuple(map(float, line.split()[1:4])))
             elif line.startswith(b"f "):
                 # A corner can also carry texture and normal numbers, as in 4/1 or 4/1/2.
-                # Negative numbers count back from the last vertex read, as list indexes do.
+                # Negative numbers count back from the last vertex read.
                 numbers = [int(part.partition(b"/")[0]) for part in line.split()[1:]]
-                corners = [vertices[number - 1 if number > 0 else number] for number in numbers]
+                corners = [
+                    number - 1 if number > 0 else len(vertices) + number for number in numbers
+                ]
                 for second, third in zip(corners[1:], corners[2:]):
-                    triangles.append((corners[0], second, third))
-    return triangles
+                    faces.append((corners[0], second, third))
+    return vertices, faces
+
+
+def read_obj_triangles(path):
+    """Read an OBJ model's faces as triangles of corner positions, splitting larger faces."""
+    vertices, faces = read_obj(path)
+    return [(vertices[a], vertices[b], vertices[c]) for a, b, c in faces]
 
 
 def facet_normal(a, b, c):
@@ -537,7 +554,7 @@ def write_report(path, report):
 
 
 Measurement = namedtuple("Measurement", "distance worst_error narrowest_angle")
-RealSize = namedtuple("RealSize", "mm_per_unit size_mm")
+RealSize = namedtuple("RealSize", "mm_per_unit size_mm photo_mm_per_unit spread edge_spots")
 
 
 def click_ray(camera, pose, click):
@@ -594,20 +611,27 @@ def widest_angle(rays):
     return widest
 
 
+def read_dense_model(dense_dir):
+    """Read the undistorted cameras and poses that the clicked photos belong to."""
+    try:
+        return (
+            read_cameras(dense_dir / "sparse" / "cameras.bin"),
+            read_poses(dense_dir / "sparse" / "images.bin"),
+        )
+    except (OSError, struct.error):
+        raise PipelineError(
+            f"Setting the real size needs the working files in {dense_dir.parent}, and they're "
+            "missing. Run the photos again to make them."
+        ) from None
+
+
 def measure_length(dense_dir, clicks):
     """Find how far apart two points are in the model, from where they were clicked.
 
     clicks maps photo names to [point 1, point 2], each an (x, y) pixel position or None.
     COLMAP puts the center of a photo's top-left pixel at (0.5, 0.5).
     """
-    try:
-        cameras = read_cameras(dense_dir / "sparse" / "cameras.bin")
-        poses = read_poses(dense_dir / "sparse" / "images.bin")
-    except (OSError, struct.error):
-        raise PipelineError(
-            f"Setting the real size needs the working files in {dense_dir.parent}, and they're "
-            "missing. Run the photos again to make them."
-        ) from None
+    cameras, poses = read_dense_model(dense_dir)
     points, errors, angles = [], [], []
     for number in (0, 1):
         views = [
@@ -649,30 +673,204 @@ def length_problems(measurement):
     return problems
 
 
-def set_real_size(output_dir, clicks, length_mm):
-    """Save model.stl in millimetres, from a known length clicked in the photos."""
+def surface_problems(real_size):
+    """Return a sentence for each sign that sizes found on the surface may be wrong."""
+    problems = []
+    if real_size.edge_spots:
+        spots = real_size.edge_spots
+        listed = ", ".join(spots[:-1]) + " and " + spots[-1] if len(spots) > 1 else spots[0]
+        problems.append(
+            f"{listed[0].upper()}{listed[1:]} {'is' if len(spots) == 1 else 'are'} on an edge or "
+            "corner, where the line of sight can slip past the model onto what's behind it. Click "
+            "a flat area instead, or use the same spots in several photos."
+        )
+    if len(real_size.photo_mm_per_unit) < 2:
+        problems.append(
+            "Only one photo was measured, so nothing checks it. Measure in a second photo too, "
+            "so a spot the surface got wrong shows up."
+        )
+    elif real_size.spread > MAX_SURFACE_SPREAD:
+        problems.append(
+            f"The photos disagree by {real_size.spread:.0%} (aim for {MAX_SURFACE_SPREAD:.0%} or "
+            "less). A spot on a corner or edge, or a wrong length, is the usual cause. Check "
+            "each photo, or use the same spots in several photos instead."
+        )
+    return problems
+
+
+def project_vertices(vertices, camera, pose):
+    """Return each corner's pixel column, row and depth in one photo. Depth 0 or less is behind."""
+    fx, fy, cx, cy = camera
+    _, ((r00, r01, r02), (r10, r11, r12), (r20, r21, r22)), (tx, ty, tz) = pose
+    columns, rows, depths = [], [], []
+    for x, y, z in vertices:
+        depth = r20 * x + r21 * y + r22 * z + tz
+        scale = 1 / depth if depth > 0 else 0.0
+        columns.append(fx * (r00 * x + r01 * y + r02 * z + tx) * scale + cx)
+        rows.append(fy * (r10 * x + r11 * y + r12 * z + ty) * scale + cy)
+        depths.append(depth)
+    return columns, rows, depths
+
+
+def ray_triangle(start, direction, a, b, c):
+    """Return how far along a ray it meets a triangle, or None if it misses (Moller-Trumbore)."""
+    e1 = [b[i] - a[i] for i in range(3)]
+    e2 = [c[i] - a[i] for i in range(3)]
+    p = (
+        direction[1] * e2[2] - direction[2] * e2[1],
+        direction[2] * e2[0] - direction[0] * e2[2],
+        direction[0] * e2[1] - direction[1] * e2[0],
+    )
+    whole = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2]
+    if abs(whole) < 1e-15:
+        return None  # The ray runs along the triangle's plane.
+    s = [start[i] - a[i] for i in range(3)]
+    u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) / whole
+    if u < 0 or u > 1:
+        return None
+    q = (s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0])
+    v = (direction[0] * q[0] + direction[1] * q[1] + direction[2] * q[2]) / whole
+    if v < 0 or u + v > 1:
+        return None
+    distance = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) / whole
+    return distance if distance > 0 else None
+
+
+def surface_point(vertices, faces, projection, camera, pose, click):
+    """Return where the line of sight through a clicked pixel first meets the model, or None."""
+    columns, rows, depths = projection
+    u, v = click
+    start, direction = click_ray(camera, pose, click)
+    nearest = math.inf
+    for a, b, c in faces:
+        # Most faces are nowhere near the click in the photo, so rule those out cheaply first.
+        ua, ub, uc = columns[a], columns[b], columns[c]
+        if (u < ua and u < ub and u < uc) or (u > ua and u > ub and u > uc):
+            continue
+        va, vb, vc = rows[a], rows[b], rows[c]
+        if (v < va and v < vb and v < vc) or (v > va and v > vb and v > vc):
+            continue
+        if depths[a] <= 0 or depths[b] <= 0 or depths[c] <= 0:
+            continue
+        distance = ray_triangle(start, direction, vertices[a], vertices[b], vertices[c])
+        if distance is not None and distance < nearest:
+            nearest = distance
+    if nearest == math.inf:
+        return None
+    return [start[i] + nearest * direction[i] for i in range(3)]
+
+
+def surface_bend(vertices, faces, projection, camera, pose, click, point):
+    """Return how far from flat the surface is around a click, relative to its distance.
+
+    On a flat area, even one seen at a slant, the surface on either side of the click is as far
+    in front as behind. Across an edge it isn't.
+    """
+    start = click_ray(camera, pose, click)[0]
+    centre = math.dist(start, point)
+    bend = 0.0
+    for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
+        step = EDGE_CHECK_PIXELS / math.hypot(dx, dy)
+        sides = []
+        for sign in (1, -1):
+            beside = [click[0] + sign * dx * step, click[1] + sign * dy * step]
+            found = surface_point(vertices, faces, projection, camera, pose, beside)
+            if found is None:
+                return math.inf  # At the edge of the model itself.
+            sides.append(math.dist(start, found))
+        bend = max(bend, abs(sides[0] + sides[1] - 2 * centre) / centre)
+    return bend
+
+
+def finished_model(output_dir):
+    """Return a finished run's folder, model and report, or explain that there isn't one."""
     output_dir = Path(output_dir).resolve()
-    model_dir = output_dir / "model"
-    report_path = output_dir / REPORT_NAME
-    if not report_path.exists() or not (model_dir / "model.obj").exists():
+    model, report = output_dir / "model" / "model.obj", output_dir / REPORT_NAME
+    if not model.exists() or not report.exists():
         raise PipelineError(f"There's no model in {output_dir} yet.")
+    return output_dir, model, report
+
+
+def save_real_size(report_path, model, vertices, faces, real_size):
+    """Rewrite model.stl at the real size, remember how it was found, and return the size."""
+    scale = real_size["mm_per_unit"]
+    triangles = [(vertices[a], vertices[b], vertices[c]) for a, b, c in faces]
+    write_stl(model.with_suffix(".stl"), triangles, scale)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["real_size"] = real_size
+    write_report(report_path, report)
+    return [(max(axis) - min(axis)) * scale for axis in zip(*vertices)]
+
+
+def set_real_size(output_dir, clicks, length_mm):
+    """Save model.stl in millimetres, from the same two spots clicked in several photos."""
+    output_dir, model, report_path = finished_model(output_dir)
     if length_mm <= 0:
         raise PipelineError("The length must be more than 0 mm.")
     measurement = measure_length(output_dir / "work" / "dense", clicks)
     mm_per_unit = length_mm / measurement.distance
-    triangles = read_obj_triangles(model_dir / "model.obj")
-    write_stl(model_dir / "model.stl", triangles, mm_per_unit)
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    report["real_size"] = {
+    vertices, faces = read_obj(model)
+    size = save_real_size(report_path, model, vertices, faces, {
+        "method": "same_spots",
         "length_mm": length_mm,
         "mm_per_unit": mm_per_unit,
         "worst_click_error": round(measurement.worst_error, 2),
         "narrowest_angle": round(measurement.narrowest_angle, 1),
         "clicks": clicks,
-    }
-    write_report(report_path, report)
-    corners = [corner for triangle in triangles for corner in triangle]
-    return RealSize(mm_per_unit, [(max(axis) - min(axis)) * mm_per_unit for axis in zip(*corners)])
+    })
+    return RealSize(mm_per_unit, size, {}, None, [])
+
+
+def set_real_size_on_surface(output_dir, clicks, lengths_mm):
+    """Save model.stl in millimetres, from two spots clicked in each of one or more photos.
+
+    Each spot is found where its line of sight meets the model, so every photo can have its
+    own pair and its own known length, and no spot has to be found again in another photo.
+    """
+    output_dir, model, report_path = finished_model(output_dir)
+    cameras, poses = read_dense_model(output_dir / "work" / "dense")
+    pairs = {name: points for name, points in clicks.items() if any(points)}
+    if not pairs:
+        raise PipelineError("Click two spots in a photo, and type the real length between them.")
+    for name, points in pairs.items():
+        if not all(points):
+            raise PipelineError(f"{name} has only one point. Click the other, or clear the photo.")
+        if lengths_mm.get(name, 0) <= 0:
+            raise PipelineError(f"Type the real length between the two points in {name}.")
+    vertices, faces = read_obj(model)
+    distances, edge_spots = {}, []
+    for name, points in pairs.items():
+        camera, pose = cameras[poses[name][0]], poses[name]
+        projection = project_vertices(vertices, camera, pose)
+        found = []
+        for number, click in enumerate(points):
+            point = surface_point(vertices, faces, projection, camera, pose, click)
+            if point is None:
+                raise PipelineError(
+                    f"Point {number + 1} in {name} isn't on the model. Click a spot on the object "
+                    "or the table, not the background."
+                )
+            found.append(point)
+            bend = surface_bend(vertices, faces, projection, camera, pose, click, point)
+            if bend > MAX_SURFACE_BEND:
+                edge_spots.append(f"point {number + 1} in {name}")
+        distances[name] = math.dist(*found)
+        if distances[name] == 0:
+            raise PipelineError(f"Points 1 and 2 in {name} are the same spot.")
+    photo_mm_per_unit = {name: lengths_mm[name] / distances[name] for name in pairs}
+    # Longer lengths count for more, because the surface's errors are a fixed size.
+    mm_per_unit = sum(lengths_mm[name] for name in pairs) / sum(distances.values())
+    spread = (max(photo_mm_per_unit.values()) - min(photo_mm_per_unit.values())) / mm_per_unit
+    size = save_real_size(report_path, model, vertices, faces, {
+        "method": "surface",
+        "mm_per_unit": mm_per_unit,
+        "lengths_mm": {name: lengths_mm[name] for name in pairs},
+        "photo_mm_per_unit": photo_mm_per_unit,
+        "spread": spread,
+        "edge_spots": edge_spots,
+        "clicks": pairs,
+    })
+    return RealSize(mm_per_unit, size, photo_mm_per_unit, spread, edge_spots)
 
 
 class Pipeline:

@@ -1,8 +1,9 @@
-"""Window for giving a model its real size, by clicking both ends of a known length in photos."""
+"""Window for giving a model its real size, from known lengths clicked in its photos."""
 
 import json
 import math
 import subprocess
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -17,6 +18,8 @@ from pipeline import (
     read_cameras,
     read_poses,
     set_real_size,
+    set_real_size_on_surface,
+    surface_problems,
     widest_angle,
 )
 
@@ -27,12 +30,20 @@ DETAIL_SIZE = 400
 ZOOM = 4
 SPAN = DETAIL_SIZE // ZOOM  # Photo pixels across the zoomed view.
 COLOURS = ("#ff2a2a", "#1e90ff")
-HELP = (
-    "Click both ends of something you know the length of, such as a ruler, in three photos "
-    "taken at least 30 degrees apart. Two photos are enough to measure, but a third lets the "
-    "program catch a click on the wrong spot. Click near a point in the photo, then exactly on "
-    "it in the zoomed view."
-)
+SAME_SPOTS, SURFACE = "same_spots", "surface"
+HELP = {
+    SAME_SPOTS: (
+        "Click the same two spots, such as the ends of a ruler, in three photos taken at least 30 "
+        "degrees apart, then type the real length between them. This is the most accurate way, "
+        "and it works on corners, but each spot must be easy to find again in every photo."
+    ),
+    SURFACE: (
+        "In each photo you use, click any two spots and type the real length between them. The "
+        "program finds each spot on the model's surface, so every photo can use different spots. "
+        "Click flat areas, not corners or edges, and measure in two or more photos so the program "
+        "can check them against each other."
+    ),
+}
 
 
 class RealSizeWindow(tk.Toplevel):
@@ -58,33 +69,49 @@ class RealSizeWindow(tk.Toplevel):
         self.ffmpeg = tools["ffmpeg"]["exe"]
         self.poses = poses
         self.cameras = cameras
-        names = sorted(poses)
+        self.names = sorted(poses)
         saved = report.get("real_size", {})
-        self.clicks = {name: [None, None] for name in names}
+        self.clicks = {name: [None, None] for name in self.names}
         for name, points in saved.get("clicks", {}).items():
             if name in self.clicks:
                 self.clicks[name] = [tuple(point) if point else None for point in points]
-        self.names = names
+        self.same_length = f"{saved['length_mm']:g}" if "length_mm" in saved else ""
+        self.lengths = {name: f"{mm:g}" for name, mm in saved.get("lengths_mm", {}).items()}
         self.name = None
         self.photo = None
         self.overview = None
         self.subsample = 1
         self.corner = (0, 0)  # Top left of the zoomed view, in photo pixels.
         self.detail = tk.PhotoImage(width=DETAIL_SIZE, height=DETAIL_SIZE)
+        self.mode = tk.StringVar(value=saved.get("method", SAME_SPOTS))
         self.point = tk.IntVar(value=0)
         self.rough = False  # Whether the current point was only placed in the shrunk photo.
+        self.help = tk.StringVar(value=HELP[self.mode.get()])
         self.guide = tk.StringVar()
-        self.length = tk.StringVar(value=f"{saved['length_mm']:g}" if saved else "")
+        self.length = tk.StringVar()
+        self.length_label = tk.StringVar()
+        self.showing_length = False
+        self.outcome = None
         self.result = tk.StringVar()
         self._build()
+        self.length.trace_add("write", self._on_length_typed)
         self.photo_list.selection_set(0)
-        self._show(names[0])
+        self._show(self.names[0])
 
     def _build(self):
-        ttk.Label(self, text=HELP, wraplength=1100, padding=(12, 12, 12, 6)).pack(fill="x")
+        modes = ttk.Frame(self, padding=(12, 12, 12, 0))
+        modes.pack(fill="x")
+        for text, value in (
+            ("The same spots in several photos", SAME_SPOTS),
+            ("Different spots in each photo", SURFACE),
+        ):
+            ttk.Radiobutton(
+                modes, text=text, variable=self.mode, value=value, command=self._on_mode
+            ).pack(side="left", padx=(0, 16))
+        ttk.Label(self, textvariable=self.help, wraplength=1100, padding=(12, 6)).pack(fill="x")
         views = ttk.Frame(self, padding=(12, 0))
         views.pack(fill="both", expand=True)
-        self.photo_list = tk.Listbox(views, width=26, exportselection=False)
+        self.photo_list = tk.Listbox(views, width=34, exportselection=False)
         scrollbar = ttk.Scrollbar(views, command=self.photo_list.yview)
         self.photo_list.configure(yscrollcommand=scrollbar.set)
         for name in self.names:
@@ -121,15 +148,21 @@ class RealSizeWindow(tk.Toplevel):
                 command=self._on_point_chosen,
             ).pack(side="left", padx=(0, 10))
         ttk.Button(controls, text="Clear This Photo", command=self._clear).pack(side="left")
-        ttk.Label(controls, text="Length (mm)").pack(side="left", padx=(24, 4))
+        ttk.Label(controls, textvariable=self.length_label).pack(side="left", padx=(24, 4))
         ttk.Entry(controls, textvariable=self.length, width=10).pack(side="left")
-        ttk.Button(controls, text="Save", command=self.save).pack(side="left", padx=8)
+        self.save_button = ttk.Button(controls, text="Save", command=self.save)
+        self.save_button.pack(side="left", padx=8)
         ttk.Label(self, textvariable=self.result, wraplength=1100, padding=(12, 0, 12, 12)).pack(
             fill="x"
         )
 
+    def _surface(self):
+        return self.mode.get() == SURFACE
+
     def _list_text(self, name):
         marks = " ".join(str(number + 1) for number, point in enumerate(self.clicks[name]) if point)
+        if self._surface() and self.lengths.get(name):
+            marks += f"   {self.lengths[name]} mm"
         return f"{name}   {marks}"
 
     def _on_select(self, _event):
@@ -150,6 +183,7 @@ class RealSizeWindow(tk.Toplevel):
         # Start on the first point this photo still needs, whatever the last photo was on.
         self.point.set(1 if points[0] and not points[1] else 0)
         self.rough = False
+        self._show_length()
         clicked = [point for point in points if point]
         self._zoom_at(*(clicked[0] if clicked else (width / 2, height / 2)))
         self._update_guide()
@@ -169,6 +203,33 @@ class RealSizeWindow(tk.Toplevel):
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
         return ppm
+
+    def _show_length(self):
+        """Show the shared length, or this photo's own length when each photo has its own."""
+        self.showing_length = True
+        self.length.set(self.lengths.get(self.name, "") if self._surface() else self.same_length)
+        self.length_label.set("Length in this photo (mm)" if self._surface() else "Length (mm)")
+        self.showing_length = False
+
+    def _on_length_typed(self, *_):
+        if self.showing_length:
+            return
+        if self._surface():
+            self.lengths[self.name] = self.length.get()
+            self._refresh_list()
+        else:
+            self.same_length = self.length.get()
+        self._update_guide()
+
+    def _on_mode(self):
+        self.help.set(HELP[self.mode.get()])
+        for index, name in enumerate(self.names):
+            self.photo_list.delete(index)
+            self.photo_list.insert(index, self._list_text(name))
+        self.photo_list.selection_set(self.names.index(self.name))
+        self.rough = False
+        self._show_length()
+        self._update_guide()
 
     def _zoom_at(self, x, y):
         width, height = self.photo.width(), self.photo.height()
@@ -222,16 +283,19 @@ class RealSizeWindow(tk.Toplevel):
         self._update_guide()
 
     def _update_guide(self):
-        """Say what to click next, and how far along each point is."""
+        """Say what to click next, and how far along the measuring is."""
         number = self.point.get()
         points = self.clicks[self.name]
+        measured = self._surface() and all(points) and self.lengths.get(self.name, "").strip()
         if self.rough:
             step = f"Now click exactly on point {number + 1} in the zoomed view on the right."
         elif points[number] is None:
             step = f"Click near point {number + 1} in the photo."
+        elif all(points) and self._surface() and not measured:
+            step = "Both points are set. Type the real length between them below."
         elif all(points):
             step = (
-                "Both points are set in this photo. Choose another photo, taken further around. "
+                "This photo is done. Choose another photo, taken further around, or click Save. "
                 "To move a point, choose it below and click in the zoomed view."
             )
         else:
@@ -239,6 +303,10 @@ class RealSizeWindow(tk.Toplevel):
                 f"Point {number + 1} is set. Click in the zoomed view to move it, or choose "
                 f"Point {2 - number} below."
             )
+        progress = self._surface_progress() if self._surface() else self._progress()
+        self.guide.set(f"{step}\n{progress}")
+
+    def _progress(self):
         progress = []
         for number in (0, 1):
             rays = [
@@ -250,9 +318,19 @@ class RealSizeWindow(tk.Toplevel):
             if len(rays) >= 2:
                 text += f", seen from {widest_angle(rays):.0f} degrees apart"
             progress.append(text)
-        self.guide.set(
-            f"{step}\n{progress[0]}. {progress[1]}. Each needs 2 photos, better 3, seen from at "
-            "least 30 degrees apart."
+        return (
+            f"{progress[0]}. {progress[1]}. Each needs 2 photos, better 3, seen from at least "
+            "30 degrees apart."
+        )
+
+    def _surface_progress(self):
+        count = sum(
+            1 for name, points in self.clicks.items()
+            if all(points) and self.lengths.get(name, "").strip()
+        )
+        return (
+            f"{count} photo{'' if count == 1 else 's'} measured. One is enough to set the size, "
+            "and two or more let the program check them against each other."
         )
 
     def _refresh_list(self):
@@ -292,34 +370,83 @@ class RealSizeWindow(tk.Toplevel):
         )
 
     def save(self):
-        try:
-            length = float(self.length.get())
-        except ValueError:
-            messagebox.showinfo(TITLE, "Type the real length in millimetres.", parent=self)
-            return
         clicks = {
             name: [list(point) if point else None for point in points]
             for name, points in self.clicks.items()
             if any(points)
         }
+        if self._surface():
+            lengths = {}
+            for name in clicks:
+                text = self.lengths.get(name, "").strip()
+                try:
+                    lengths[name] = float(text) if text else 0
+                except ValueError:
+                    messagebox.showinfo(
+                        TITLE, f"The length for {name} isn't a number.", parent=self
+                    )
+                    return
+            self._save_in_background(
+                lambda: set_real_size_on_surface(self.output_dir, clicks, lengths)
+            )
+            return
+        try:
+            length = float(self.same_length)
+        except ValueError:
+            messagebox.showinfo(TITLE, "Type the real length in millimetres.", parent=self)
+            return
         try:
             problems = length_problems(measure_length(self.dense, clicks))
-            if problems and not messagebox.askyesno(
-                TITLE, "\n\n".join(problems) + "\n\nSave anyway?", parent=self
-            ):
-                return
-            self.result.set("Saving model.stl...")
-            self.configure(cursor="watch")
-            self.update_idletasks()
-            real_size = set_real_size(self.output_dir, clicks, length)
         except PipelineError as error:
-            self.result.set("")
             messagebox.showinfo(TITLE, str(error), parent=self)
             return
-        finally:
-            self.configure(cursor="")
-        x, y, z = real_size.size_mm
-        self.result.set(
+        if problems and not messagebox.askyesno(
+            TITLE, "\n\n".join(problems) + "\n\nSave anyway?", parent=self
+        ):
+            return
+        self._save_in_background(lambda: set_real_size(self.output_dir, clicks, length))
+
+    def _save_in_background(self, job):
+        """Saving reads the whole model, which can take several seconds."""
+        self.result.set("Saving model.stl...")
+        self.configure(cursor="watch")
+        self.save_button.state(["disabled"])
+        self.outcome = None
+
+        def work():
+            try:
+                self.outcome = ("saved", job())
+            except PipelineError as error:
+                self.outcome = ("failed", str(error))
+            except Exception as error:
+                self.outcome = ("failed", f"Unexpected error: {error!r}")
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._check_saved)
+
+    def _check_saved(self):
+        if self.outcome is None:
+            self.after(100, self._check_saved)
+            return
+        self.configure(cursor="")
+        self.save_button.state(["!disabled"])
+        kind, value = self.outcome
+        if kind == "failed":
+            self.result.set("")
+            messagebox.showinfo(TITLE, value, parent=self)
+            return
+        x, y, z = value.size_mm
+        lines = [
             f"Saved. model.stl is now in millimetres, {x:.0f} x {y:.0f} x {z:.0f} mm including "
-            f"anything around the object. 1 model unit = {real_size.mm_per_unit:.2f} mm."
-        )
+            f"anything around the object. 1 model unit = {value.mm_per_unit:.2f} mm."
+        ]
+        if value.photo_mm_per_unit:
+            each = ", ".join(
+                f"{name} {scale:.2f}" for name, scale in value.photo_mm_per_unit.items()
+            )
+            lines.append(f"Each photo gave, in mm per unit: {each}.")
+            problems = surface_problems(value)
+            lines += problems
+            if problems:
+                messagebox.showinfo(TITLE, "Saved, but:\n\n" + "\n\n".join(problems), parent=self)
+        self.result.set(" ".join(lines))

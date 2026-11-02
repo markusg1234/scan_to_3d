@@ -27,10 +27,16 @@ from pipeline import (
     photo_problems,
     pick_sharpest,
     read_camera_centers,
+    project_vertices,
+    ray_triangle,
     read_cameras,
+    read_obj,
     read_obj_triangles,
     select_expression,
     set_real_size,
+    set_real_size_on_surface,
+    surface_point,
+    surface_problems,
     still_share,
     view_model,
     viewing_angle,
@@ -542,6 +548,115 @@ class RealSizeTests(PipelineTestCase):
         self.finished_run()
         with self.assertRaisesRegex(PipelineError, "more than 0"):
             set_real_size(self.output, clicks_from([0, 90]), 0)
+
+
+PLANE_OBJ = "v -3 -3 0\nv 3 -3 0\nv 3 3 0\nv -3 3 0\nf 1 2 3 4\n"
+# Two pairs of spots on that plane, each photo measuring its own pair.
+PLANE_PAIRS = {0: ((-1.0, 0.2, 0.0), (1.0, -0.3, 0.0)), 30: ((0.5, 1.0, 0.0), (-0.5, -1.0, 0.0))}
+
+
+def plane_clicks():
+    return {
+        f"photo{index}.jpg": [project(angle, point) for point in PLANE_PAIRS[angle]]
+        for index, angle in enumerate(PLANE_PAIRS)
+    }
+
+
+def ten_mm_per_unit_lengths():
+    return {
+        f"photo{index}.jpg": 10 * math.dist(*PLANE_PAIRS[angle])
+        for index, angle in enumerate(PLANE_PAIRS)
+    }
+
+
+class SurfaceTests(PipelineTestCase):
+    def finished_run(self):
+        self.run_pipeline(FakeRunner(obj=PLANE_OBJ))
+        write_dense_model(self.output / "work" / "dense", list(PLANE_PAIRS))
+
+    def test_a_ray_meets_a_triangle_at_the_right_distance(self):
+        triangle = ((-1, -1, 0), (1, -1, 0), (0, 1, 0))
+        self.assertAlmostEqual(ray_triangle((0, 0, -5), (0, 0, 1), *triangle), 5)
+        self.assertIsNone(ray_triangle((5, 0, -5), (0, 0, 1), *triangle))
+        self.assertIsNone(ray_triangle((0, 0, 5), (0, 0, 1), *triangle))  # Behind the start.
+        self.assertIsNone(ray_triangle((0, 0, -5), (1, 0, 0), *triangle))  # Along its plane.
+
+    def test_the_nearest_surface_along_the_line_of_sight_is_found(self):
+        near = "v -0.2 -0.2 -1\nv 0.2 -0.2 -1\nv 0.2 0.2 -1\nv -0.2 0.2 -1\nf 5 6 7 8\n"
+        path = self.root / "two.obj"
+        path.write_text(PLANE_OBJ + near)
+        vertices, faces = read_obj(path)
+        camera, pose = CAMERA, (1, ((1, 0, 0), (0, 1, 0), (0, 0, 1)), (0, 0, CAMERA_DISTANCE))
+        projection = project_vertices(vertices, camera, pose)
+        found = surface_point(vertices, faces, projection, camera, pose, project(0, (0, 0, 0)))
+        self.assertEqual([round(value, 9) for value in found], [0, 0, -1])
+        found = surface_point(vertices, faces, projection, camera, pose, project(0, (1, 1, 0)))
+        self.assertEqual([round(value, 9) for value in found], [1, 1, 0])
+        off_the_model = project(0, (5, 0, 0))
+        self.assertIsNone(surface_point(vertices, faces, projection, camera, pose, off_the_model))
+
+    def test_each_photo_can_measure_its_own_pair_of_spots(self):
+        self.finished_run()
+        real_size = set_real_size_on_surface(self.output, plane_clicks(), ten_mm_per_unit_lengths())
+        self.assertAlmostEqual(real_size.mm_per_unit, 10)
+        self.assertLess(real_size.spread, 1e-9)
+        self.assertEqual(surface_problems(real_size), [])
+        _, triangles = read_stl(self.output / "model" / "model.stl")
+        self.assertEqual([round(value, 3) for value in triangles[0][3:6]], [-30, -30, 0])
+        saved = self.saved_report()["real_size"]
+        self.assertEqual(saved["method"], "surface")
+        self.assertEqual(saved["lengths_mm"], ten_mm_per_unit_lengths())
+
+    def test_photos_that_disagree_are_flagged(self):
+        self.finished_run()
+        lengths = ten_mm_per_unit_lengths()
+        lengths["photo1.jpg"] *= 1.1
+        problems = surface_problems(set_real_size_on_surface(self.output, plane_clicks(), lengths))
+        self.assertIn("disagree by 10%", problems[0])
+
+    def test_one_photo_works_but_is_flagged_as_unchecked(self):
+        self.finished_run()
+        clicks = {"photo0.jpg": plane_clicks()["photo0.jpg"]}
+        real_size = set_real_size_on_surface(self.output, clicks, ten_mm_per_unit_lengths())
+        self.assertAlmostEqual(real_size.mm_per_unit, 10)
+        self.assertIn("Only one photo", surface_problems(real_size)[0])
+
+    def test_a_spot_beside_a_step_is_flagged_as_on_an_edge(self):
+        raised_half = "v -3 -3 -1\nv 0 -3 -1\nv 0 3 -1\nv -3 3 -1\nf 5 6 7 8\n"
+        self.run_pipeline(FakeRunner(obj=PLANE_OBJ + raised_half))
+        write_dense_model(self.output / "work" / "dense", [0])
+        beside_the_step, far_from_it = (0.02, 0.5, 0.0), (1.5, 0.5, 0.0)
+        clicks = {"photo0.jpg": [project(0, beside_the_step), project(0, far_from_it)]}
+        lengths = {"photo0.jpg": 10 * math.dist(beside_the_step, far_from_it)}
+        real_size = set_real_size_on_surface(self.output, clicks, lengths)
+        self.assertAlmostEqual(real_size.mm_per_unit, 10)
+        self.assertEqual(real_size.edge_spots, ["point 1 in photo0.jpg"])
+        self.assertIn("Point 1 in photo0.jpg is on an edge", surface_problems(real_size)[0])
+
+    def test_a_spot_off_the_model_is_explained(self):
+        self.finished_run()
+        clicks = plane_clicks()
+        clicks["photo0.jpg"][1] = project(0, (5, 0, 0))
+        with self.assertRaisesRegex(PipelineError, "Point 2 in photo0.jpg isn't on the model"):
+            set_real_size_on_surface(self.output, clicks, ten_mm_per_unit_lengths())
+
+    def test_a_photo_without_its_length_or_second_point_is_explained(self):
+        self.finished_run()
+        lengths = ten_mm_per_unit_lengths()
+        del lengths["photo1.jpg"]
+        with self.assertRaisesRegex(PipelineError, "Type the real length .* photo1.jpg"):
+            set_real_size_on_surface(self.output, plane_clicks(), lengths)
+        clicks = plane_clicks()
+        clicks["photo1.jpg"][1] = None
+        with self.assertRaisesRegex(PipelineError, "photo1.jpg has only one point"):
+            set_real_size_on_surface(self.output, clicks, ten_mm_per_unit_lengths())
+
+    def test_the_mesh_reader_keeps_corner_numbers_and_counts_back_from_the_end(self):
+        path = self.root / "model.obj"
+        path.write_text("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf -4 -3 -2 -1\n")
+        vertices, faces = read_obj(path)
+        self.assertEqual(faces, [(0, 1, 2), (0, 2, 3)])
+        self.assertEqual(vertices[3], (0, 1, 0))
 
 
 class StlFileTests(unittest.TestCase):
